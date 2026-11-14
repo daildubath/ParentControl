@@ -147,36 +147,31 @@ class ParentControlApp(Gtk.Window):
         box.set_border_width(10)
 
         # Feed Controls
-        feed_frame = Gtk.Frame(label='Blocklist Feeds')
+        feed_frame = Gtk.Frame(label='Default Blocklist Feed')
+        feed_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        feed_box.set_border_width(10)
         
-        self.acl_grid = Gtk.Grid()
-        self.acl_grid.set_column_spacing(20)
-        self.acl_grid.set_row_spacing(10)
-        self.acl_grid.set_border_width(10)
+        self.feed_switch = Gtk.Switch()
+        self.feed_switch.connect('notify::active', self._on_feed_toggle)
+        feed_box.pack_start(Gtk.Label(label='Enable Feed:'), False, False, 0)
+        feed_box.pack_start(self.feed_switch, False, False, 0)
         
-        # Create the switches
-        self.switch_stevenblack = Gtk.Switch()
-        self.switch_phishing = Gtk.Switch()
-        
-        self.switch_stevenblack.set_valign(Gtk.Align.CENTER)
-        self.switch_phishing.set_valign(Gtk.Align.CENTER)
-        
-        # Connect the toggle signals, passing the feed name as user data
-        self.switch_stevenblack.connect("notify::active", self._on_feed_toggle, "stevenblack")
-        self.switch_phishing.connect("notify::active", self._on_feed_toggle, "phishing_army")
-        
-        # Add them to the layout
-        self.acl_grid.attach(Gtk.Label(label="StevenBlack Ad/Malware Blocklist", xalign=0), 0, 0, 1, 1)
-        self.acl_grid.attach(self.switch_stevenblack, 1, 0, 1, 1)
-        
-        self.acl_grid.attach(Gtk.Label(label="Phishing Army Blocklist", xalign=0), 0, 1, 1, 1)
-        self.acl_grid.attach(self.switch_phishing, 1, 1, 1, 1)
+        self.feed_count_lbl = Gtk.Label(label='Domains: 0')
+        feed_box.pack_start(self.feed_count_lbl, False, False, 0)
 
-        btn_sync = Gtk.Button(label='Sync Feeds Now')
+        btn_sync = Gtk.Button(label='Sync Feed Now')
         btn_sync.connect('clicked', self._sync_acl_feed)
-        self.acl_grid.attach(btn_sync, 0, 2, 2, 1)
+        feed_box.pack_start(btn_sync, False, False, 0)
+
+        self.feed_url_entry = Gtk.Entry()
+        self.feed_url_entry.set_placeholder_text('Custom Feed URL')
+        feed_box.pack_start(self.feed_url_entry, True, True, 0)
+
+        btn_set_url = Gtk.Button(label='Set URL')
+        btn_set_url.connect('clicked', self._set_acl_feed_url)
+        feed_box.pack_start(btn_set_url, False, False, 0)
         
-        feed_frame.add(self.acl_grid)
+        feed_frame.add(feed_box)
         box.pack_start(feed_frame, False, False, 0)
 
         # Target Inputs
@@ -221,47 +216,39 @@ class ParentControlApp(Gtk.Window):
                 if target:
                     self.acl_store.append([f"{l_type}|{target}", f"[{l_type.upper()}] {target}"])
             
-            # Safely extract dynamic feed states
-            feeds = payload.get("feed_sources", {})
-            sb_enabled = feeds.get("stevenblack", {}).get("enabled", False)
-            phish_enabled = feeds.get("phishing_army", {}).get("enabled", False)
-            
-            # Block signals so setting the state programmatically doesn't fire the toggle callback
-            self.switch_stevenblack.handler_block_by_func(self._on_feed_toggle)
-            self.switch_stevenblack.set_active(sb_enabled)
-            self.switch_stevenblack.handler_unblock_by_func(self._on_feed_toggle)
-            
-            self.switch_phishing.handler_block_by_func(self._on_feed_toggle)
-            self.switch_phishing.set_active(phish_enabled)
-            self.switch_phishing.handler_unblock_by_func(self._on_feed_toggle)
-            
+            self.feed_switch.set_active(payload.get('default_feed_enabled', False))
+            self.feed_count_lbl.set_text(f"Domains: {payload.get('feed_domains_count', 0)}")
         except Exception as exc:
             logging.exception('ACL Load Error: %s', exc)
         finally:
             self._loading = False
 
-    def _on_feed_toggle(self, switch, gparam, feed_name):
+    def _on_feed_toggle(self, switch, gparam):
         if self._loading: return
-        is_enabled = 'true' if switch.get_active() else 'false'
         try:
-            self._backend_command('acl', '--action', 'toggle-feed', '--feed', feed_name, '--enabled', is_enabled)
-            logging.info(f"Successfully toggled {feed_name} to {is_enabled}")
+            state = 'true' if switch.get_active() else 'false'
+            self._backend_command('acl', '--action', 'toggle-feed', '--enabled', state)
             self._load_acl_rules()
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'ACL Feed Error', str(exc))
-            
-            # Revert the UI switch state if the backend command failed
-            switch.handler_block_by_func(self._on_feed_toggle)
-            switch.set_active(not switch.get_active())
-            switch.handler_unblock_by_func(self._on_feed_toggle)
 
     def _sync_acl_feed(self, widget):
         try:
             self._backend_command('acl', '--action', 'sync')
             self._load_acl_rules()
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Feeds synced successfully.')
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Feed synced successfully.')
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'ACL Sync Error', str(exc))
+
+    def _set_acl_feed_url(self, widget):
+        url = self.feed_url_entry.get_text().strip()
+        if not url: return
+        try:
+            self._backend_command('acl', '--action', 'set-feed', '--url', url)
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Feed URL updated.')
+            self._load_acl_rules()
+        except Exception as exc:
+            self._show_msg(Gtk.MessageType.ERROR, 'ACL URL Error', str(exc))
 
     def _add_acl_entry(self, list_type):
         target = self.acl_entry.get_text().strip()
@@ -477,62 +464,52 @@ class ParentControlApp(Gtk.Window):
 
         self.notebook.append_page(box, Gtk.Label(label='Permissions (RWX)'))
 
-def _load_permissions(self):
+    def _load_permissions(self):
         self._loading = True
         try:
             payload = self._backend_command('perms', '--action', 'list').get('data', {})
             self.default_browse_dir = payload.get('default_browse_dir', '/home')
-
+            
             # Presets
             presets = payload.get('presets', {})
             for p_name, chk in self.rwx_presets.items():
                 chk.set_active(presets.get(p_name, False))
-
+                
             # Custom Rules
             self.rwx_store.clear()
             for rule in payload.get('custom_rules', []):
                 path = rule.get('path')
                 perms = rule.get('perms', '---')
-                label = rule.get('label', '')
-                display = f'[{perms}] {label} — {path}' if label else f'[{perms}] {path}'
-                self.rwx_store.append([path, display])
+                self.rwx_store.append([path, f'[{perms}] {path}'])
         except Exception as exc:
             logging.exception('Perms Load Error: %s', exc)
         finally:
             self._loading = False
 
-def _toggle_rwx_preset(self, chk, preset_name):
-        if self._loading:
-            return
+    def _toggle_rwx_preset(self, chk, preset_name):
+        if self._loading: return
         state = 'true' if chk.get_active() else 'false'
         try:
             self._backend_command('perms', '--action', 'preset', '--name', preset_name, '--enabled', state)
         except Exception as exc:
-            self._loading = True
-            chk.set_active(not chk.get_active())
-            self._loading = False
             self._show_msg(Gtk.MessageType.ERROR, 'Preset Error', str(exc))
 
-def _browse_directory(self, widget):
+    def _browse_directory(self, widget):
         dialog = Gtk.FileChooserDialog(
             title='Select Folder', parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER
         )
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
         if hasattr(self, 'default_browse_dir') and os.path.isdir(self.default_browse_dir):
             dialog.set_current_folder(self.default_browse_dir)
-
+            
         if dialog.run() == Gtk.ResponseType.OK:
             self.dir_entry.set_text(dialog.get_filename())
         dialog.destroy()
 
-def _apply_rwx(self, widget):
+    def _apply_rwx(self, widget):
         target = self.dir_entry.get_text().strip()
         mode_idx = self.mode_combo.get_active()
-        if not target:
-            self._show_msg(Gtk.MessageType.WARNING, 'Missing Folder', 'Please enter or browse for a target folder path first.')
-            return
-        if mode_idx < 0:
-            return
+        if not target or mode_idx < 0: return
         try:
             self._backend_command('perms', '--action', 'set', '--path', target, '--mode', self.modes[mode_idx])
             self.dir_entry.set_text('')
@@ -540,8 +517,7 @@ def _apply_rwx(self, widget):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Permissions Error', str(exc))
 
-
-def _remove_rwx_rule(self, widget):
+    def _remove_rwx_rule(self, widget):
         selection = self.rwx_tree.get_selection()
         model, treeiter = selection.get_selected()
         if not treeiter: return
@@ -553,7 +529,7 @@ def _remove_rwx_rule(self, widget):
             self._show_msg(Gtk.MessageType.ERROR, 'Permissions Error', str(exc))
 
     # --- DEVICES TAB ---
-def _build_device_tab(self):
+    def _build_device_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -578,7 +554,7 @@ def _build_device_tab(self):
         box.pack_start(frame, True, True, 0)
         self.notebook.append_page(box, Gtk.Label(label='Devices'))
 
-def _load_devices(self):
+    def _load_devices(self):
         try:
             payload = self._backend_command('devices', '--action', 'list').get('data', {})
             self.device_states = payload.get('devices', {})
@@ -587,7 +563,7 @@ def _load_devices(self):
         except Exception as exc:
             logging.exception('Devices Load Error: %s', exc)
 
-def _apply_device_rules(self, widget):
+    def _apply_device_rules(self, widget):
         try:
             for key, check in self.device_checks.items():
                 active = check.get_active()
@@ -598,8 +574,8 @@ def _apply_device_rules(self, widget):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Devices Error', str(exc))
 
-   # --- APPS TAB ---
-def _build_apps_tab(self):
+    # --- APPS TAB ---
+    def _build_apps_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -612,103 +588,104 @@ def _build_apps_tab(self):
         self.lock_installers_switch.connect('notify::active', self._on_lock_installers_toggle)
         settings_box.pack_start(Gtk.Label(label='Lock Software Installers:'), False, False, 0)
         settings_box.pack_start(self.lock_installers_switch, False, False, 0)
-        
-        btn_scan = Gtk.Button(label='Scan Installed Apps')
-        btn_scan.connect('clicked', self._scan_apps)
-        settings_box.pack_end(btn_scan, False, False, 0)
-        
         settings_frame.add(settings_box)
         box.pack_start(settings_frame, False, False, 0)
 
-        # List (Checkbox, ID, Name, Exec)
-        list_frame = Gtk.Frame(label='Application Permissions')
-        self.apps_store = Gtk.ListStore(bool, str, str, str)
-        self.apps_tree = Gtk.TreeView(model=self.apps_store)
+        # Controls
+        ctrl_frame = Gtk.Frame(label='Manage Desktop Apps')
+        ctrl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        ctrl_box.set_border_width(10)
         
-        # Checkbox Column (Allow / Block)
-        toggle_renderer = Gtk.CellRendererToggle()
-        toggle_renderer.connect("toggled", self._on_app_toggled)
-        toggle_column = Gtk.TreeViewColumn("Allowed", toggle_renderer, active=0)
-        self.apps_tree.append_column(toggle_column)
+        btn_scan = Gtk.Button(label='Scan Installed Apps')
+        btn_scan.connect('clicked', self._scan_apps)
+        ctrl_box.pack_start(btn_scan, False, False, 0)
 
-        # Text Columns
-        headers = ["Name", "Exec"]
-        for i, header in enumerate(headers):
-            renderer = Gtk.CellRendererText()
-            column = Gtk.TreeViewColumn(header, renderer, text=i+2) # +2 because index 0 is bool, 1 is hidden ID
-            self.apps_tree.append_column(column)
+        self.apps_combo = Gtk.ComboBoxText()
+        ctrl_box.pack_start(self.apps_combo, True, True, 0)
+        
+        btn_allow = Gtk.Button(label='Allow App')
+        btn_allow.connect('clicked', lambda _: self._set_app_rule('Allow'))
+        ctrl_box.pack_start(btn_allow, False, False, 0)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.add(self.apps_tree)
+        btn_block = Gtk.Button(label='Block App')
+        btn_block.connect('clicked', lambda _: self._set_app_rule('Block'))
+        ctrl_box.pack_start(btn_block, False, False, 0)
+
+        ctrl_frame.add(ctrl_box)
+        box.pack_start(ctrl_frame, False, False, 0)
+
+        # List
+        list_frame = Gtk.Frame(label='App Rules')
+        self.apps_store, self.apps_tree, scroll = self._create_list_view('App Status')
         list_frame.add(scroll)
         box.pack_start(list_frame, True, True, 0)
 
+        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        btn_remove = Gtk.Button(label='Remove Rule')
+        btn_remove.connect('clicked', self._remove_app_rule)
+        action_box.pack_end(btn_remove, False, False, 0)
+        box.pack_start(action_box, False, False, 0)
+
         self.notebook.append_page(box, Gtk.Label(label='Applications'))
 
-def _populate_apps_list(self, apps):
-        """Helper to populate the TreeView from an apps array."""
-        self.apps_store.clear()
-        for app in apps:
-            name = app.get('name', '')
-            exec_cmd = app.get('exec', '')
-            status = app.get('status', 'allow').lower()
-            desktop_id = app.get('desktop_id', name)
-            
-            # True if allowed, False if blocked
-            is_allowed = (status != 'block')
-            
-            if name:
-                self.apps_store.append([is_allowed, desktop_id, name, exec_cmd])
-
-def _load_apps(self):
+    def _load_apps(self):
         self._loading = True
         try:
             payload = self._backend_command('apps', '--action', 'list').get('data', {})
             self.lock_installers_switch.set_active(payload.get('lock_installers', False))
             
-            apps = payload.get('applications', [])
-            self._populate_apps_list(apps)
+            self.apps_store.clear()
+            for rule in payload.get('rules', []):
+                name = rule.get('name')
+                status = rule.get('status')
+                self.apps_store.append([name, f"[{status}] {name}"])
         except Exception as exc:
             logging.exception('Apps Load Error: %s', exc)
         finally:
             self._loading = False
 
-def _scan_apps(self, widget):
-        try:
-            payload = self._backend_command('apps', '--action', 'scan').get('data', {})
-            apps = payload.get('applications', [])
-            self._populate_apps_list(apps)
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Scan complete.')
-        except Exception as exc:
-            self._show_msg(Gtk.MessageType.ERROR, 'Scan Error', str(exc))
-
-def _on_app_toggled(self, widget, path):
-        # Invert the current boolean value in the store
-        current_state = self.apps_store[path][0]
-        new_state = not current_state
-        self.apps_store[path][0] = new_state
-        
-        # Get the App Name from column 2 (index 2)
-        app_name = self.apps_store[path][2]
-        status_str = 'Allow' if new_state else 'Block'
-        
-        try:
-            self._backend_command('apps', '--action', 'set', '--app', app_name, '--status', status_str)
-        except Exception as exc:
-            # Revert the checkbox if the backend command fails
-            self.apps_store[path][0] = current_state
-            self._show_msg(Gtk.MessageType.ERROR, 'App Rule Error', str(exc))
-
-def _on_lock_installers_toggle(self, switch, gparam):
+    def _on_lock_installers_toggle(self, switch, gparam):
         if self._loading: return
         state = 'true' if switch.get_active() else 'false'
         try:
             self._backend_command('apps', '--action', 'lock-installers', '--enabled', state)
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'App Error', str(exc))
+
+    def _scan_apps(self, widget):
+        try:
+            payload = self._backend_command('apps', '--action', 'scan').get('data', {})
+            self.apps_combo.remove_all()
+            for app in payload.get('apps', []):
+                self.apps_combo.append_text(app)
+            if payload.get('apps'):
+                self.apps_combo.set_active(0)
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Scan complete.')
+        except Exception as exc:
+            self._show_msg(Gtk.MessageType.ERROR, 'Scan Error', str(exc))
+
+    def _set_app_rule(self, status):
+        app = self.apps_combo.get_active_text()
+        if not app: return
+        try:
+            self._backend_command('apps', '--action', 'set', '--app', app, '--status', status)
+            self._load_apps()
+        except Exception as exc:
+            self._show_msg(Gtk.MessageType.ERROR, 'App Rule Error', str(exc))
+
+    def _remove_app_rule(self, widget):
+        selection = self.apps_tree.get_selection()
+        model, treeiter = selection.get_selected()
+        if not treeiter: return
+        app_name = model[treeiter][0]
+        try:
+            self._backend_command('apps', '--action', 'remove', '--app', app_name)
+            self._remove_selected_from_tree(self.apps_tree, self.apps_store)
+        except Exception as exc:
+            self._show_msg(Gtk.MessageType.ERROR, 'App Remove Error', str(exc))
+
     # --- QUEUE TAB ---
-def _build_queue_tab(self):
+    def _build_queue_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -747,7 +724,7 @@ def _build_queue_tab(self):
         box.pack_start(action_box, False, False, 0)
         self.notebook.append_page(box, Gtk.Label(label='Approvals Queue'))
 
-def _load_queue(self):
+    def _load_queue(self):
         try:
             payload = self._backend_command('queue', '--action', 'list').get('data', {})
             self.queue_store.clear()
@@ -760,7 +737,7 @@ def _load_queue(self):
         except Exception as exc:
             logging.exception('Queue Load Error: %s', exc)
 
-def _handle_queue_action(self, action):
+    def _handle_queue_action(self, action):
         selection = self.queue_tree.get_selection()
         model, treeiter = selection.get_selected()
         if not treeiter: return
@@ -772,7 +749,7 @@ def _handle_queue_action(self, action):
             self._show_msg(Gtk.MessageType.ERROR, 'Queue Error', str(exc))
 
     # --- MAINT TAB ---
-def _build_maint_tab(self):
+    def _build_maint_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -827,7 +804,7 @@ def _build_maint_tab(self):
         box.pack_start(auto_frame, False, False, 0)
         self.notebook.append_page(box, Gtk.Label(label='Automation & Access'))
 
-def _load_maint(self):
+    def _load_maint(self):
         self._loading = True
         try:
             payload = self._backend_command('maint', '--action', 'list').get('data', {})
@@ -843,7 +820,7 @@ def _load_maint(self):
         finally:
             self._loading = False
 
-def _on_senior_preset(self, switch, gparam):
+    def _on_senior_preset(self, switch, gparam):
         if self._loading: return
         state = 'true' if switch.get_active() else 'false'
         try:
@@ -851,7 +828,7 @@ def _on_senior_preset(self, switch, gparam):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Preset Error', str(exc))
 
-def _apply_time_limit(self, widget):
+    def _apply_time_limit(self, widget):
         state = 'true' if self.time_limit_switch.get_active() else 'false'
         hours = str(self.time_limit_spin.get_value())
         try:
@@ -861,7 +838,7 @@ def _apply_time_limit(self, widget):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Time Limit Error', str(exc))
 
-def _toggle_auto_feature(self, chk, feature):
+    def _toggle_auto_feature(self, chk, feature):
         if self._loading: return
         state = 'true' if chk.get_active() else 'false'
         try:
@@ -869,16 +846,15 @@ def _toggle_auto_feature(self, chk, feature):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Maint Error', str(exc))
 
-def _run_maint_now(self):
+    def _run_maint_now(self):
         try:
-            # Backend handles detachment now; will return near-instantly without freezing GTK
             self._backend_command('maint', '--action', 'run-now')
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Maintenance task triggered successfully and is running in the background.')
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Maintenance triggered.')
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Maint Error', str(exc))
 
     # --- SETUP TAB ---
-def _build_setup_tab(self):
+    def _build_setup_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -945,7 +921,7 @@ def _build_setup_tab(self):
         
         self.notebook.append_page(box, Gtk.Label(label='Setup & Caregiver'))
 
-def _load_setup(self):
+    def _load_setup(self):
         try:
             payload = self._backend_command('status', '--action', 'check').get('data', {})
             self.setup_user_entry.set_text(payload.get('restricted_user', ''))
@@ -957,7 +933,7 @@ def _load_setup(self):
         except Exception as exc:
             logging.exception('Setup Load Error: %s', exc)
 
-def _apply_admin_setup(self, widget):
+    def _apply_admin_setup(self, widget):
         user = self.setup_user_entry.get_text().strip()
         pw1 = self.setup_pw_entry.get_text()
         pw2 = self.setup_pw2_entry.get_text()
@@ -979,14 +955,14 @@ def _apply_admin_setup(self, widget):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Setup Error', str(exc))
 
-def _restore_user_sudo(self, widget):
+    def _restore_user_sudo(self, widget):
         try:
             self._backend_command('setup', '--action', 'restore-admin')
             self._show_msg(Gtk.MessageType.INFO, 'Success', 'User sudo restored.')
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Restore Error', str(exc))
 
-def _save_contact(self, widget):
+    def _save_contact(self, widget):
         name = self.contact_entries['name'].get_text()
         phone = self.contact_entries['phone'].get_text()
         email = self.contact_entries['email'].get_text()
@@ -998,7 +974,7 @@ def _save_contact(self, widget):
             self._show_msg(Gtk.MessageType.ERROR, 'Contact Error', str(exc))
 
     # --- STATUS TAB ---
-def _build_status_tab(self):
+    def _build_status_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.set_border_width(10)
 
@@ -1038,7 +1014,7 @@ def _build_status_tab(self):
 
         self.notebook.append_page(box, Gtk.Label(label='Status & Logs'))
 
-def _refresh_status(self):
+    def _refresh_status(self):
         try:
             payload = self._backend_command('status', '--action', 'check').get('data', {})
             lines = [
@@ -1058,7 +1034,7 @@ def _refresh_status(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Status Error', str(exc))
 
-def _load_full_logs(self, widget):
+    def _load_full_logs(self, widget):
         try:
             payload = self._backend_command('logs', '--action', 'read', '--lines', '100').get('data', {})
             buf = self.log_textview.get_buffer()
@@ -1066,14 +1042,14 @@ def _load_full_logs(self, widget):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Log Error', str(exc))
 
-def _clear_logs(self, widget):
+    def _clear_logs(self, widget):
         try:
             self._backend_command('logs', '--action', 'clear')
             self._refresh_status()
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Log Error', str(exc))
 
-def refresh_all(self):
+    def refresh_all(self):
         self._load_acl_rules()
         self._load_ports()
         self._load_permissions()
