@@ -1,4 +1,4 @@
-﻿import gi
+import gi
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib
@@ -10,6 +10,325 @@ import sys
 import traceback
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+
+
+class SetupWizardDialog(Gtk.Dialog):
+    """Step-by-step interactive first-run setup wizard matching pc-setup.sh --action wizard."""
+
+    def __init__(self, parent, status_data):
+        super().__init__(
+            title="ParentControl — First-Time Setup Wizard",
+            transient_for=parent,
+            flags=Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+        )
+        self.parent_app = parent
+        self.status_data = status_data or {}
+        self.set_default_size(620, 470)
+        self.set_border_width(12)
+
+        content = self.get_content_area()
+        content.set_spacing(10)
+
+        header = Gtk.Label()
+        header.set_markup(
+            "<big><b>Welcome to ParentControl Setup</b></big>\n"
+            "Complete these 4 quick steps to lock down the monitored account and configure caregiver settings."
+        )
+        header.set_xalign(0)
+        header.set_line_wrap(True)
+        content.pack_start(header, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.stack.set_transition_duration(200)
+        content.pack_start(self.stack, True, True, 0)
+
+        self._build_step1_admin()
+        self._build_step2_profile()
+        self._build_step3_contact()
+        self._build_step4_baseline()
+
+        self.step_names = ["step1", "step2", "step3", "step4"]
+        self.current_step = 0
+
+        # Navigation bar
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.step_lbl = Gtk.Label(label="Step 1 of 4: Administrator Separation")
+        self.step_lbl.set_xalign(0)
+        nav_box.pack_start(self.step_lbl, True, True, 0)
+
+        self.btn_cancel = Gtk.Button(label="Skip for Now")
+        self.btn_cancel.connect("clicked", lambda _: self.response(Gtk.ResponseType.CANCEL))
+        nav_box.pack_start(self.btn_cancel, False, False, 0)
+
+        self.btn_back = Gtk.Button(label="< Back")
+        self.btn_back.set_sensitive(False)
+        self.btn_back.connect("clicked", self._on_back)
+        nav_box.pack_start(self.btn_back, False, False, 0)
+
+        self.btn_next = Gtk.Button(label="Next >")
+        self.btn_next.get_style_context().add_class("suggested-action")
+        self.btn_next.connect("clicked", self._on_next_or_finish)
+        nav_box.pack_start(self.btn_next, False, False, 0)
+
+        content.pack_start(nav_box, False, False, 0)
+        self.show_all()
+
+    def _build_step1_admin(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(10)
+
+        info = Gtk.Label(
+            label="ParentControl separates a dedicated administrator account ('pcadmin') from the daily "
+                  "desktop user so settings cannot be bypassed."
+        )
+        info.set_xalign(0)
+        info.set_line_wrap(True)
+        box.pack_start(info, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+        grid.attach(Gtk.Label(label="Monitored Desktop User:", xalign=0), 0, 0, 1, 1)
+        self.wiz_user_entry = Gtk.Entry()
+        self.wiz_user_entry.set_text(self.status_data.get("restricted_user") or "mint")
+        self.wiz_user_entry.set_hexpand(True)
+        grid.attach(self.wiz_user_entry, 1, 0, 1, 1)
+
+        grid.attach(Gtk.Label(label="New 'pcadmin' Password:", xalign=0), 0, 1, 1, 1)
+        self.wiz_pw1_entry = Gtk.Entry()
+        self.wiz_pw1_entry.set_visibility(False)
+        self.wiz_pw1_entry.set_placeholder_text("Minimum 6 characters")
+        grid.attach(self.wiz_pw1_entry, 1, 1, 1, 1)
+
+        grid.attach(Gtk.Label(label="Confirm Password:", xalign=0), 0, 2, 1, 1)
+        self.wiz_pw2_entry = Gtk.Entry()
+        self.wiz_pw2_entry.set_visibility(False)
+        grid.attach(self.wiz_pw2_entry, 1, 2, 1, 1)
+        box.pack_start(grid, False, False, 0)
+
+        self.wiz_strip_chk = Gtk.CheckButton(
+            label="Strip sudo / admin privileges from the monitored user (Recommended)"
+        )
+        self.wiz_strip_chk.set_active(True)
+        box.pack_start(self.wiz_strip_chk, False, False, 0)
+
+        self.stack.add_named(box, "step1")
+
+    def _build_step2_profile(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_border_width(10)
+
+        intro = Gtk.Label(label="Choose the primary care profile for this computer:")
+        intro.set_xalign(0)
+        box.pack_start(intro, False, False, 0)
+
+        self.wiz_radio_senior = Gtk.RadioButton.new_with_label_from_widget(
+            None,
+            "Dementia / Senior Care Profile (Recommended for older adults)"
+        )
+        senior_desc = Gtk.Label(
+            label="   • Increases desktop text scaling to 1.25x and enlarges mouse cursor\n"
+                  "   • Disables confusing screen hot-corners across logins"
+        )
+        senior_desc.set_xalign(0)
+
+        self.wiz_radio_child = Gtk.RadioButton.new_with_label_from_widget(
+            self.wiz_radio_senior,
+            "Child / Student Safety Profile"
+        )
+        child_desc = Gtk.Label(
+            label="   • Keeps standard desktop sizing and hot-corners\n"
+                  "   • Focuses on web filtering, app locks, and screen-time limits"
+        )
+        child_desc.set_xalign(0)
+
+        if self.status_data.get("senior_preset", True):
+            self.wiz_radio_senior.set_active(True)
+        else:
+            self.wiz_radio_child.set_active(True)
+
+        box.pack_start(self.wiz_radio_senior, False, False, 0)
+        box.pack_start(senior_desc, False, False, 0)
+        box.pack_start(self.wiz_radio_child, False, False, 0)
+        box.pack_start(child_desc, False, False, 0)
+
+        self.stack.add_named(box, "step2")
+
+    def _build_step3_contact(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(10)
+
+        intro = Gtk.Label(
+            label="This contact information appears in the monitored user's 'Caregiver Help & Request Access' popup:"
+        )
+        intro.set_xalign(0)
+        intro.set_line_wrap(True)
+        box.pack_start(intro, False, False, 0)
+
+        contact = self.status_data.get("admin_contact", {})
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10)
+
+        grid.attach(Gtk.Label(label="Caregiver Name:", xalign=0), 0, 0, 1, 1)
+        self.wiz_cname = Gtk.Entry()
+        self.wiz_cname.set_text(contact.get("name", ""))
+        self.wiz_cname.set_placeholder_text("e.g., Sarah (Daughter) or Mom & Dad")
+        self.wiz_cname.set_hexpand(True)
+        grid.attach(self.wiz_cname, 1, 0, 1, 1)
+
+        grid.attach(Gtk.Label(label="Phone / SMS:", xalign=0), 0, 1, 1, 1)
+        self.wiz_cphone = Gtk.Entry()
+        self.wiz_cphone.set_text(contact.get("phone", ""))
+        self.wiz_cphone.set_placeholder_text("e.g., 555-0199")
+        grid.attach(self.wiz_cphone, 1, 1, 1, 1)
+
+        grid.attach(Gtk.Label(label="Email:", xalign=0), 0, 2, 1, 1)
+        self.wiz_cemail = Gtk.Entry()
+        self.wiz_cemail.set_text(contact.get("email", ""))
+        self.wiz_cemail.set_placeholder_text("e.g., caregiver@example.com")
+        grid.attach(self.wiz_cemail, 1, 2, 1, 1)
+
+        grid.attach(Gtk.Label(label="Help Note:", xalign=0), 0, 3, 1, 1)
+        self.wiz_cnote = Gtk.Entry()
+        self.wiz_cnote.set_text(
+            contact.get("note") or "Need a website or application unlocked? Send a request below."
+        )
+        grid.attach(self.wiz_cnote, 1, 3, 1, 1)
+
+        box.pack_start(grid, False, False, 0)
+        self.stack.add_named(box, "step3")
+
+    def _build_step4_baseline(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_border_width(10)
+
+        intro = Gtk.Label(
+            label="Select recommended baseline protections to activate immediately:"
+        )
+        intro.set_xalign(0)
+        box.pack_start(intro, False, False, 0)
+
+        self.wiz_chk_feeds = Gtk.CheckButton(
+            label="Enable StevenBlack (Ads/Malware) & Phishing Army web blocklists"
+        )
+        self.wiz_chk_feeds.set_active(True)
+        box.pack_start(self.wiz_chk_feeds, False, False, 0)
+
+        self.wiz_chk_ports = Gtk.CheckButton(
+            label="Block common risky remote-access ports (FTP, SSH, Telnet, SMB, RDP, VNC)"
+        )
+        self.wiz_chk_ports.set_active(True)
+        box.pack_start(self.wiz_chk_ports, False, False, 0)
+
+        self.wiz_chk_installers = Gtk.CheckButton(
+            label="Lock software installers (Software Manager, Synaptic, Flatpak, GDebi)"
+        )
+        self.wiz_chk_installers.set_active(True)
+        box.pack_start(self.wiz_chk_installers, False, False, 0)
+
+        note = Gtk.Label(
+            label="You can customize websites, folders, apps, hardware locks, and screen-time limits anytime "
+                  "in the main ParentControl tabs."
+        )
+        note.set_xalign(0)
+        note.set_line_wrap(True)
+        box.pack_end(note, False, False, 0)
+
+        self.stack.add_named(box, "step4")
+
+    def _update_nav_ui(self):
+        titles = [
+            "Step 1 of 4: Administrator Separation",
+            "Step 2 of 4: Care Profile Selection",
+            "Step 3 of 4: Caregiver Contact Info",
+            "Step 4 of 4: Baseline Security Protections",
+        ]
+        self.step_lbl.set_text(titles[self.current_step])
+        self.stack.set_visible_child_name(self.step_names[self.current_step])
+        self.btn_back.set_sensitive(self.current_step > 0)
+        if self.current_step == len(self.step_names) - 1:
+            self.btn_next.set_label("Finish & Apply Setup")
+        else:
+            self.btn_next.set_label("Next >")
+
+    def _on_back(self, _widget):
+        if self.current_step > 0:
+            self.current_step -= 1
+            self._update_nav_ui()
+
+    def _on_next_or_finish(self, _widget):
+        if self.current_step == 0:
+            user = self.wiz_user_entry.get_text().strip()
+            pw1 = self.wiz_pw1_entry.get_text()
+            pw2 = self.wiz_pw2_entry.get_text()
+            if not user:
+                self.parent_app._show_msg(Gtk.MessageType.WARNING, "Missing User", "Enter the monitored username.")
+                return
+            if len(pw1) < 6:
+                self.parent_app._show_msg(Gtk.MessageType.WARNING, "Weak Password", "Please enter a 'pcadmin' password of at least 6 characters.")
+                return
+            if pw1 != pw2:
+                self.parent_app._show_msg(Gtk.MessageType.WARNING, "Password Mismatch", "The two password fields do not match.")
+                return
+
+        if self.current_step < len(self.step_names) - 1:
+            self.current_step += 1
+            self._update_nav_ui()
+            return
+
+        self._apply_wizard()
+
+    def _apply_wizard(self):
+        self.btn_next.set_sensitive(False)
+        self.btn_back.set_sensitive(False)
+        try:
+            user = self.wiz_user_entry.get_text().strip()
+            pw1 = self.wiz_pw1_entry.get_text()
+            strip_flag = "true" if self.wiz_strip_chk.get_active() else "false"
+            senior_flag = "true" if self.wiz_radio_senior.get_active() else "false"
+
+            self.parent_app._backend_command(
+                "setup", "--action", "provision-admin",
+                "--user", user,
+                "--admin-password", pw1,
+                "--strip-user-sudo", strip_flag,
+            )
+
+            self.parent_app._backend_command(
+                "setup", "--action", "set-contact",
+                "--name", self.wiz_cname.get_text().strip(),
+                "--phone", self.wiz_cphone.get_text().strip(),
+                "--email", self.wiz_cemail.get_text().strip(),
+                "--note", self.wiz_cnote.get_text().strip(),
+            )
+
+            self.parent_app._backend_command(
+                "maint", "--action", "senior-preset", "--enabled", senior_flag
+            )
+
+            if self.wiz_chk_feeds.get_active():
+                self.parent_app._backend_command(
+                    "acl", "--action", "toggle-feed", "--feed", "all", "--enabled", "true"
+                )
+
+            if self.wiz_chk_ports.get_active():
+                self.parent_app._backend_command(
+                    "ports", "--action", "block-preset", "--preset", "risky"
+                )
+
+            if self.wiz_chk_installers.get_active():
+                self.parent_app._backend_command(
+                    "apps", "--action", "lock-installers", "--enabled", "true"
+                )
+
+            self.parent_app._show_msg(
+                Gtk.MessageType.INFO,
+                "Setup Complete",
+                "ParentControl has been configured and all selected protections are now active."
+            )
+            self.response(Gtk.ResponseType.OK)
+        except Exception as exc:
+            self.btn_next.set_sensitive(True)
+            self.btn_back.set_sensitive(True)
+            self.parent_app._show_msg(Gtk.MessageType.ERROR, "Setup Failed", str(exc))
 
 
 class ParentControlApp(Gtk.Window):
@@ -54,6 +373,10 @@ class ParentControlApp(Gtk.Window):
         paths_item = Gtk.MenuItem(label='System Paths & Logs')
         paths_item.connect('activate', self._show_paths)
         help_menu.append(paths_item)
+
+        wizard_item = Gtk.MenuItem(label='Run Setup Wizard')
+        wizard_item.connect('activate', lambda _: self._open_setup_wizard(force=True))
+        help_menu.append(wizard_item)
 
         about_item = Gtk.MenuItem(label='About')
         about_item.connect('activate', self._show_about)
@@ -903,6 +1226,10 @@ class ParentControlApp(Gtk.Window):
         btn_apply.connect('clicked', self._apply_admin_setup)
         btn_row.pack_start(btn_apply, False, False, 0)
         
+        btn_wizard = Gtk.Button(label='Launch Setup Wizard')
+        btn_wizard.connect('clicked', lambda _: self._open_setup_wizard(force=True))
+        btn_row.pack_start(btn_wizard, False, False, 0)
+
         btn_restore = Gtk.Button(label='Restore User Sudo')
         btn_restore.connect('clicked', self._restore_user_sudo)
         btn_row.pack_end(btn_restore, False, False, 0)
@@ -1008,7 +1335,9 @@ class ParentControlApp(Gtk.Window):
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.log_textview = Gtk.TextView()
         self.log_textview.set_editable(False)
-        self.log_textview.modify_font(gi.repository.Pango.FontDescription('monospace 10'))
+        css = Gtk.CssProvider()
+        css.load_from_data(b'textview { font-family: monospace; font-size: 10pt; }')
+        self.log_textview.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         scroll.add(self.log_textview)
         log_box.pack_start(scroll, True, True, 0)
 
@@ -1050,8 +1379,12 @@ class ParentControlApp(Gtk.Window):
     def _load_full_logs(self, widget):
         try:
             payload = self._backend_command('logs', '--action', 'read', '--lines', '100').get('data', {})
+            entries = payload.get('entries', [])
+            lines = [e.get('message', '') if isinstance(e, dict) else str(e) for e in entries]
+            if not lines:
+                lines = payload.get('logs', [])
             buf = self.log_textview.get_buffer()
-            buf.set_text('\n'.join(payload.get('logs', [])))
+            buf.set_text('\n'.join(lines))
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Log Error', str(exc))
 
@@ -1061,6 +1394,19 @@ class ParentControlApp(Gtk.Window):
             self._refresh_status()
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Log Error', str(exc))
+
+    def _open_setup_wizard(self, force=False):
+        try:
+            status_data = self._backend_command('status', '--action', 'check').get('data', {})
+        except Exception:
+            status_data = {}
+        if not force and status_data.get('admin_password_configured', False):
+            return
+        dlg = SetupWizardDialog(self, status_data)
+        res = dlg.run()
+        dlg.destroy()
+        if res == Gtk.ResponseType.OK:
+            self.refresh_all()
 
     def refresh_all(self):
         self._load_acl_rules()
@@ -1078,6 +1424,7 @@ if __name__ == '__main__':
         app = ParentControlApp()
         app.connect('destroy', Gtk.main_quit)
         app.show_all()
+        GLib.idle_add(app._open_setup_wizard, False)
         Gtk.main()
     except Exception:
         logging.critical('Crash: %s', traceback.format_exc())
