@@ -587,7 +587,7 @@ class ParentControlApp(Gtk.Window):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Devices Error', str(exc))
 
-    # --- APPS TAB ---
+   # --- APPS TAB ---
     def _build_apps_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
@@ -601,42 +601,30 @@ class ParentControlApp(Gtk.Window):
         self.lock_installers_switch.connect('notify::active', self._on_lock_installers_toggle)
         settings_box.pack_start(Gtk.Label(label='Lock Software Installers:'), False, False, 0)
         settings_box.pack_start(self.lock_installers_switch, False, False, 0)
-        settings_frame.add(settings_box)
-        box.pack_start(settings_frame, False, False, 0)
-
-        # Controls
-        ctrl_frame = Gtk.Frame(label='Manage Desktop Apps')
-        ctrl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-        ctrl_box.set_border_width(10)
         
         btn_scan = Gtk.Button(label='Scan Installed Apps')
         btn_scan.connect('clicked', self._scan_apps)
-        ctrl_box.pack_start(btn_scan, False, False, 0)
-
-        self.app_combo = Gtk.ComboBoxText()
-        self.app_combo.set_sensitive(False)
-        ctrl_box.pack_start(self.app_combo, True, True, 0)
+        settings_box.pack_end(btn_scan, False, False, 0)
         
-        btn_allow = Gtk.Button(label='Allow App')
-        btn_allow.connect('clicked', lambda _: self._set_app_rule('Allow'))
-        ctrl_box.pack_start(btn_allow, False, False, 0)
+        settings_frame.add(settings_box)
+        box.pack_start(settings_frame, False, False, 0)
 
-        btn_block = Gtk.Button(label='Block App')
-        btn_block.connect('clicked', lambda _: self._set_app_rule('Block'))
-        ctrl_box.pack_start(btn_block, False, False, 0)
-
-        ctrl_frame.add(ctrl_box)
-        box.pack_start(ctrl_frame, False, False, 0)
-
-        # List
-        list_frame = Gtk.Frame(label='App Rules')
-        self.apps_store = Gtk.ListStore(str, str, str, str) # Hidden ID, Name, Exec, Status
+        # List (Checkbox, ID, Name, Exec)
+        list_frame = Gtk.Frame(label='Application Permissions')
+        self.apps_store = Gtk.ListStore(bool, str, str, str)
         self.apps_tree = Gtk.TreeView(model=self.apps_store)
         
-        headers = ["Name", "Exec", "Status"]
+        # Checkbox Column (Allow / Block)
+        toggle_renderer = Gtk.CellRendererToggle()
+        toggle_renderer.connect("toggled", self._on_app_toggled)
+        toggle_column = Gtk.TreeViewColumn("Allowed", toggle_renderer, active=0)
+        self.apps_tree.append_column(toggle_column)
+
+        # Text Columns
+        headers = ["Name", "Exec"]
         for i, header in enumerate(headers):
             renderer = Gtk.CellRendererText()
-            column = Gtk.TreeViewColumn(header, renderer, text=i+1)
+            column = Gtk.TreeViewColumn(header, renderer, text=i+2) # +2 because index 0 is bool, 1 is hidden ID
             self.apps_tree.append_column(column)
 
         scroll = Gtk.ScrolledWindow()
@@ -645,13 +633,22 @@ class ParentControlApp(Gtk.Window):
         list_frame.add(scroll)
         box.pack_start(list_frame, True, True, 0)
 
-        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        btn_remove = Gtk.Button(label='Remove Rule')
-        btn_remove.connect('clicked', self._remove_app_rule)
-        action_box.pack_end(btn_remove, False, False, 0)
-        box.pack_start(action_box, False, False, 0)
-
         self.notebook.append_page(box, Gtk.Label(label='Applications'))
+
+    def _populate_apps_list(self, apps):
+        """Helper to populate the TreeView from an apps array."""
+        self.apps_store.clear()
+        for app in apps:
+            name = app.get('name', '')
+            exec_cmd = app.get('exec', '')
+            status = app.get('status', 'allow').lower()
+            desktop_id = app.get('desktop_id', name)
+            
+            # True if allowed, False if blocked
+            is_allowed = (status != 'block')
+            
+            if name:
+                self.apps_store.append([is_allowed, desktop_id, name, exec_cmd])
 
     def _load_apps(self):
         self._loading = True
@@ -660,20 +657,37 @@ class ParentControlApp(Gtk.Window):
             self.lock_installers_switch.set_active(payload.get('lock_installers', False))
             
             apps = payload.get('applications', [])
-            self.apps_store.clear()
-            for app in apps:
-                name = app.get('name', '')
-                exec_cmd = app.get('exec', '')
-                status = app.get('status', 'unknown')
-                desktop_id = app.get('desktop_id', name)
-                
-                # Filter to apps where status is not just "allow" (meaning they have a custom restriction)
-                if status.lower() != 'allow':
-                    self.apps_store.append([desktop_id, name, exec_cmd, status.upper()])
+            self._populate_apps_list(apps)
         except Exception as exc:
             logging.exception('Apps Load Error: %s', exc)
         finally:
             self._loading = False
+
+    def _scan_apps(self, widget):
+        try:
+            payload = self._backend_command('apps', '--action', 'scan').get('data', {})
+            apps = payload.get('applications', [])
+            self._populate_apps_list(apps)
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Scan complete.')
+        except Exception as exc:
+            self._show_msg(Gtk.MessageType.ERROR, 'Scan Error', str(exc))
+
+    def _on_app_toggled(self, widget, path):
+        # Invert the current boolean value in the store
+        current_state = self.apps_store[path][0]
+        new_state = not current_state
+        self.apps_store[path][0] = new_state
+        
+        # Get the App Name from column 2 (index 2)
+        app_name = self.apps_store[path][2]
+        status_str = 'Allow' if new_state else 'Block'
+        
+        try:
+            self._backend_command('apps', '--action', 'set', '--app', app_name, '--status', status_str)
+        except Exception as exc:
+            # Revert the checkbox if the backend command fails
+            self.apps_store[path][0] = current_state
+            self._show_msg(Gtk.MessageType.ERROR, 'App Rule Error', str(exc))
 
     def _on_lock_installers_toggle(self, switch, gparam):
         if self._loading: return
@@ -682,50 +696,6 @@ class ParentControlApp(Gtk.Window):
             self._backend_command('apps', '--action', 'lock-installers', '--enabled', state)
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'App Error', str(exc))
-
-    def _scan_apps(self, widget):
-        try:
-            payload = self._backend_command('apps', '--action', 'scan').get('data', {})
-            apps = payload.get('applications', [])
-            
-            self.app_combo.remove_all()
-            for app in apps:
-                name = app.get('name', '')
-                desktop_id = app.get('desktop_id', name)
-                if name:
-                    self.app_combo.append(desktop_id, name)
-            
-            if apps:
-                self.app_combo.set_sensitive(True)
-                self.app_combo.set_active(0)
-            else:
-                self.app_combo.set_sensitive(False)
-
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Scan complete.')
-        except Exception as exc:
-            self._show_msg(Gtk.MessageType.ERROR, 'Scan Error', str(exc))
-
-    def _set_app_rule(self, status):
-        app = self.app_combo.get_active_text()
-        if not app: return
-        try:
-            self._backend_command('apps', '--action', 'set', '--app', app, '--status', status)
-            self._load_apps()
-        except Exception as exc:
-            self._show_msg(Gtk.MessageType.ERROR, 'App Rule Error', str(exc))
-
-    def _remove_app_rule(self, widget):
-        selection = self.apps_tree.get_selection()
-        model, treeiter = selection.get_selected()
-        if not treeiter: return
-        # model[treeiter][1] holds the App Name
-        app_name = model[treeiter][1]
-        try:
-            self._backend_command('apps', '--action', 'remove', '--app', app_name)
-            self._remove_selected_from_tree(self.apps_tree, self.apps_store)
-        except Exception as exc:
-            self._show_msg(Gtk.MessageType.ERROR, 'App Remove Error', str(exc))
-
     # --- QUEUE TAB ---
     def _build_queue_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
