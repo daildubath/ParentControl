@@ -3449,6 +3449,948 @@ PC_DEVICES_SH_EOF
 
 
 # ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-apps.sh (Part 5)
+# ------------------------------------------------------------------------------
+deploy_pc_apps_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-apps.sh..."
+
+    cat << 'PC_APPS_SH_EOF' > /opt/parentcontrol/bin/pc-apps.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Application & Package Governance Manager
+# File: /opt/parentcontrol/bin/pc-apps.sh
+#
+# Description:
+#   Manages per-user application Allow/Block rules (via POSIX ACLs on binaries
+#   plus root-owned .desktop menu/Desktop hiding), Software Manager/APT lock
+#   policies, and explicit package uninstalls on Linux Mint 22.3.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh apps --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     block            --app <name|desktop|binary> --json
+#     allow            --app <name|desktop|binary> --json   (alias: unblock)
+#     set              --app <name|desktop|binary> --status <Allow|Block> --json
+#     remove           --app <name|desktop|binary> --json
+#     lock-installers  --enabled <true|false> --json
+#     uninstall        --app <name|desktop|binary|pkg> --json
+#     scan             --json
+#     list             --json
+#     apply            --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "restricted_user": "mint",
+#       "lock_installers": false,
+#       "rules": [
+#         {
+#           "app": "Calculator",
+#           "name": "Calculator",
+#           "desktop_id": "org.gnome.Calculator.desktop",
+#           "binary_path": "/usr/bin/gnome-calculator",
+#           "flatpak_id": "",
+#           "status": "block"
+#         }
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="apps"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages application Allow/Block rules, icon hiding, installer locks, and package removal."
+PC_SCRIPT_USAGE="pc-apps.sh --action <block|allow|set|remove|lock-installers|uninstall|scan|list|apply> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         block, allow, set, remove, lock-installers, uninstall, scan, list, apply
+      --app <identifier>      Desktop Name, .desktop filename, command, or package name
+      --status <Allow|Block>  Target state when using --action set
+      --enabled <true|false>  Target state when using --action lock-installers"
+
+readonly PC_DESKTOP_QUARANTINE_BASE="${PC_VAR_DIR}/quarantine/desktop"
+
+APPS_ACTION=""
+TARGET_APP=""
+TARGET_STATUS=""
+LOCK_ENABLED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_apps_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                APPS_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --app)
+                TARGET_APP="${2:-}"
+                shift 2
+                ;;
+            --status)
+                TARGET_STATUS="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --enabled)
+                LOCK_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-apps.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$APPS_ACTION" ]]; then
+        pc_emit_error "Missing required --action <block|allow|set|remove|lock-installers|uninstall|scan|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$APPS_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Helpers: ACL Tool & Restricted User Lookup
+# ------------------------------------------------------------------------------
+ensure_acl_tool() {
+    if ! command -v setfacl >/dev/null 2>&1; then
+        pc_log "INFO" "setfacl not found; installing 'acl' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
+    fi
+}
+
+get_restricted_user() {
+    pc_ensure_config_exists
+    local r_user
+    r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]]; then
+        pc_emit_error "No restricted_user configured in config.json. Run pc-setup.sh first." 2
+        exit 2
+    fi
+    if ! id -u "$r_user" >/dev/null 2>&1; then
+        pc_emit_error "Configured restricted_user '${r_user}' does not exist on this system." 1
+        exit 1
+    fi
+    printf '%s' "$r_user"
+}
+
+# ------------------------------------------------------------------------------
+# Safeguard: Never Block Essential Desktop / Session / System Binaries
+# ------------------------------------------------------------------------------
+is_protected_binary() {
+    local bin_path="$1"
+    [[ -z "$bin_path" ]] && return 0
+
+    local base
+    base="$(basename "$bin_path")"
+    case "$base" in
+        bash|sh|dash|zsh|sudo|su|pkexec|polkitd|systemd|init|lightdm|slick-greeter|\
+        cinnamon|cinnamon-session|cinnamon-settings|nemo|muffin|Xorg|dbus-daemon|\
+        python3|python3.*|perl|env|coreutils|login|passwd|chpasswd|setfacl|getfacl|\
+        flatpak|snap|apt|apt-get|dpkg)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# Resolve Application Metadata from .desktop Files or $PATH
+# Outputs JSON: {"name":..., "desktop_id":..., "exec_cmd":..., "binary_path":..., "flatpak_id":...}
+# ------------------------------------------------------------------------------
+resolve_app_metadata() {
+    local query="$1"
+    local user_home="$2"
+
+    python3 -c '
+import glob, json, os, shlex, shutil, sys
+
+query = sys.argv[1].strip()
+user_home = sys.argv[2].strip()
+q_lower = query.lower()
+
+search_dirs = [
+    "/usr/share/applications",
+    "/usr/local/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+]
+if user_home:
+    search_dirs.append(os.path.join(user_home, ".local/share/applications"))
+    search_dirs.append(os.path.join(user_home, ".local/share/flatpak/exports/share/applications"))
+
+def parse_desktop(path):
+    name = ""
+    exec_raw = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            in_main = False
+            for line in f:
+                s = line.strip()
+                if s.startswith("[") and s.endswith("]"):
+                    in_main = (s == "[Desktop Entry]")
+                    continue
+                if not in_main or "=" not in s or s.startswith("#"):
+                    continue
+                k, v = s.split("=", 1)
+                if k == "Name" and not name:
+                    name = v.strip()
+                elif k == "Exec" and not exec_raw:
+                    exec_raw = v.strip()
+    except Exception:
+        return None
+    if not name and not exec_raw:
+        return None
+    return {"name": name, "exec_raw": exec_raw, "desktop_id": os.path.basename(path)}
+
+def extract_exec_details(exec_raw):
+    if not exec_raw:
+        return "", "", ""
+    try:
+        tokens = shlex.split(exec_raw)
+    except ValueError:
+        tokens = exec_raw.split()
+
+    # Strip env wrapper if present (e.g., env BAMF_DESKTOP_FILE_HINT=... cmd)
+    idx = 0
+    if tokens and os.path.basename(tokens[0]) == "env":
+        idx = 1
+        while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("/"):
+            idx += 1
+    tokens = tokens[idx:]
+    if not tokens:
+        return "", "", ""
+
+    cmd = tokens[0]
+    base_cmd = os.path.basename(cmd)
+    flatpak_id = ""
+    if base_cmd == "flatpak" and "run" in tokens[1:]:
+        run_idx = tokens.index("run")
+        for arg in tokens[run_idx + 1:]:
+            if not arg.startswith("-") and not arg.startswith("%"):
+                flatpak_id = arg
+                break
+
+    bin_path = ""
+    if not flatpak_id:
+        if os.path.isabs(cmd) and os.path.exists(cmd):
+            bin_path = os.path.realpath(cmd)
+        else:
+            found = shutil.which(cmd)
+            if found:
+                bin_path = os.path.realpath(found)
+
+    return base_cmd, bin_path, flatpak_id
+
+entries = []
+seen_ids = set()
+for d in search_dirs:
+    if not os.path.isdir(d):
+        continue
+    for fp in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+        did = os.path.basename(fp)
+        if did in seen_ids:
+            continue
+        parsed = parse_desktop(fp)
+        if parsed:
+            seen_ids.add(did)
+            entries.append(parsed)
+
+matched = None
+# Pass 1: Exact Name= match
+for e in entries:
+    if e["name"].lower() == q_lower:
+        matched = e
+        break
+
+# Pass 2: Exact .desktop filename match
+if not matched:
+    q_did = q_lower if q_lower.endswith(".desktop") else f"{q_lower}.desktop"
+    for e in entries:
+        if e["desktop_id"].lower() == q_did:
+            matched = e
+            break
+
+# Pass 3: Exec command match
+if not matched:
+    for e in entries:
+        base_cmd, _, fp_id = extract_exec_details(e["exec_raw"])
+        if base_cmd.lower() == q_lower or (fp_id and fp_id.lower() == q_lower):
+            matched = e
+            break
+
+if matched:
+    base_cmd, bin_path, fp_id = extract_exec_details(matched["exec_raw"])
+    print(json.dumps({
+        "name": matched["name"] or query,
+        "desktop_id": matched["desktop_id"],
+        "exec_cmd": base_cmd,
+        "binary_path": bin_path,
+        "flatpak_id": fp_id
+    }))
+    sys.exit(0)
+
+# Fallback: Direct binary or Flatpak ID without .desktop file
+bin_path = ""
+if os.path.isabs(query) and os.path.exists(query):
+    bin_path = os.path.realpath(query)
+else:
+    found = shutil.which(query)
+    if found:
+        bin_path = os.path.realpath(found)
+
+flatpak_id = query if (query.count(".") >= 2 and "/" not in query and not bin_path) else ""
+
+print(json.dumps({
+    "name": query,
+    "desktop_id": "",
+    "exec_cmd": os.path.basename(bin_path) if bin_path else query,
+    "binary_path": bin_path,
+    "flatpak_id": flatpak_id
+}))
+' "$query" "$user_home"
+}
+
+# ------------------------------------------------------------------------------
+# Hide or Restore .desktop Entries in Menu & ~/Desktop
+# ------------------------------------------------------------------------------
+hide_desktop_artifacts() {
+    local r_user="$1"
+    local user_home="$2"
+    local desktop_id="$3"
+    local app_name="$4"
+
+    local user_apps_dir="${user_home}/.local/share/applications"
+    local desktop_dir="${user_home}/Desktop"
+    local quarantine_dir="${PC_DESKTOP_QUARANTINE_BASE}/${r_user}"
+
+    # 1. Hide in Cinnamon Application Menu via root-owned override
+    if [[ -n "$desktop_id" ]]; then
+        mkdir -p "$user_apps_dir"
+        local override_file="${user_apps_dir}/${desktop_id}"
+        cat << EOF > "$override_file"
+# Managed by ParentControl (pc-apps.sh) - DO NOT EDIT
+[Desktop Entry]
+Type=Application
+Name=${app_name}
+Hidden=true
+NoDisplay=true
+EOF
+        chown root:root "$override_file"
+        chmod 0644 "$override_file"
+    fi
+
+    # 2. Quarantine any matching shortcut on ~/Desktop so user sees no dead icon
+    if [[ -d "$desktop_dir" ]]; then
+        mkdir -p "$quarantine_dir"
+        chown root:root "$quarantine_dir"
+        chmod 0700 "$quarantine_dir"
+
+        shopt -s nullglob
+        for desk_file in "${desktop_dir}"/*.desktop; do
+            local base_desk
+            base_desk="$(basename "$desk_file")"
+            local is_match=0
+            if [[ -n "$desktop_id" && "$base_desk" == "$desktop_id" ]]; then
+                is_match=1
+            elif [[ -n "$app_name" ]] && grep -qi "^Name=${app_name}$" "$desk_file" 2>/dev/null; then
+                is_match=1
+            fi
+            if [[ "$is_match" -eq 1 ]]; then
+                mv -f "$desk_file" "${quarantine_dir}/${base_desk}"
+                chown root:root "${quarantine_dir}/${base_desk}"
+                chmod 0644 "${quarantine_dir}/${base_desk}"
+            fi
+        done
+        shopt -u nullglob
+    fi
+}
+
+restore_desktop_artifacts() {
+    local r_user="$1"
+    local user_home="$2"
+    local desktop_id="$3"
+    local app_name="$4"
+
+    local r_group
+    r_group="$(id -gn "$r_user")"
+    local user_apps_dir="${user_home}/.local/share/applications"
+    local desktop_dir="${user_home}/Desktop"
+    local quarantine_dir="${PC_DESKTOP_QUARANTINE_BASE}/${r_user}"
+
+    # 1. Remove root-owned menu override if managed by ParentControl
+    if [[ -n "$desktop_id" ]]; then
+        local override_file="${user_apps_dir}/${desktop_id}"
+        if [[ -f "$override_file" ]] && grep -q "Managed by ParentControl" "$override_file" 2>/dev/null; then
+            rm -f "$override_file"
+        fi
+    fi
+
+    # 2. Restore any quarantined shortcut back to ~/Desktop
+    if [[ -d "$quarantine_dir" && -d "$desktop_dir" ]]; then
+        shopt -s nullglob
+        for q_file in "${quarantine_dir}"/*.desktop; do
+            local base_q
+            base_q="$(basename "$q_file")"
+            local is_match=0
+            if [[ -n "$desktop_id" && "$base_q" == "$desktop_id" ]]; then
+                is_match=1
+            elif [[ -n "$app_name" ]] && grep -qi "^Name=${app_name}$" "$q_file" 2>/dev/null; then
+                is_match=1
+            fi
+            if [[ "$is_match" -eq 1 ]]; then
+                mv -f "$q_file" "${desktop_dir}/${base_q}"
+                chown "${r_user}:${r_group}" "${desktop_dir}/${base_q}"
+                chmod 0755 "${desktop_dir}/${base_q}"
+            fi
+        done
+        shopt -u nullglob
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Enforce All Application Rules & Installer Locks
+# ------------------------------------------------------------------------------
+enforce_app_rules() {
+    local r_user="$1"
+    local user_home
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    ensure_acl_tool
+    pc_ensure_config_exists
+
+    local rules_dump
+    rules_dump="$(python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+apps_cfg = cfg.get("apps", {})
+lock_inst = "1" if apps_cfg.get("lock_installers", False) else "0"
+print(f"LOCK|{lock_inst}")
+
+for r in apps_cfg.get("rules", []):
+    status = str(r.get("status", "allow")).lower()
+    name = str(r.get("name", r.get("app", ""))).replace("|", " ")
+    did = str(r.get("desktop_id", "")).replace("|", "")
+    bpath = str(r.get("binary_path", "")).replace("|", "")
+    fpid = str(r.get("flatpak_id", "")).replace("|", "")
+    print(f"RULE|{status}|{name}|{did}|{bpath}|{fpid}")
+' "$PC_CONFIG_FILE")"
+
+    local lock_installers="0"
+    while IFS='|' read -r rec_type f1 f2 f3 f4 f5; do
+        if [[ "$rec_type" == "LOCK" ]]; then
+            lock_installers="$f1"
+            continue
+        fi
+        [[ "$rec_type" != "RULE" ]] && continue
+
+        local status="$f1"
+        local app_name="$f2"
+        local desktop_id="$f3"
+        local bin_path="$f4"
+        local flatpak_id="$f5"
+
+        if [[ "$status" == "block" ]]; then
+            if [[ -n "$flatpak_id" ]]; then
+                for fp_dir in "/var/lib/flatpak/app/${flatpak_id}" "${user_home}/.local/share/flatpak/app/${flatpak_id}"; do
+                    [[ -d "$fp_dir" ]] && setfacl -R -m "u:${r_user}:---" "$fp_dir" 2>/dev/null || true
+                done
+            elif [[ -n "$bin_path" && -e "$bin_path" ]] && ! is_protected_binary "$bin_path"; then
+                setfacl -m "u:${r_user}:---" "$bin_path" 2>/dev/null || true
+            fi
+            hide_desktop_artifacts "$r_user" "$user_home" "$desktop_id" "$app_name"
+        else
+            if [[ -n "$flatpak_id" ]]; then
+                for fp_dir in "/var/lib/flatpak/app/${flatpak_id}" "${user_home}/.local/share/flatpak/app/${flatpak_id}"; do
+                    [[ -d "$fp_dir" ]] && setfacl -R -x "u:${r_user}" "$fp_dir" 2>/dev/null || true
+                done
+            elif [[ -n "$bin_path" && -e "$bin_path" ]]; then
+                setfacl -x "u:${r_user}" "$bin_path" 2>/dev/null || true
+            fi
+            restore_desktop_artifacts "$r_user" "$user_home" "$desktop_id" "$app_name"
+        fi
+    done <<< "$rules_dump"
+
+    # Enforce or release Software Manager / Package Manager lock
+    local installer_bins=(
+        "/usr/bin/mintinstall"
+        "/usr/bin/flatpak"
+        "/usr/bin/snap"
+        "/usr/bin/apt"
+        "/usr/bin/apt-get"
+        "/usr/bin/dpkg"
+        "/usr/bin/gdebi"
+        "/usr/bin/gdebi-gtk"
+        "/usr/bin/synaptic"
+        "/usr/bin/synaptic-pkexec"
+    )
+    local installer_desktops=("mintinstall.desktop" "synaptic.desktop")
+
+    if [[ "$lock_installers" == "1" ]]; then
+        for ibin in "${installer_bins[@]}"; do
+            [[ -e "$ibin" ]] && setfacl -m "u:${r_user}:---" "$ibin" 2>/dev/null || true
+        done
+        for idesk in "${installer_desktops[@]}"; do
+            hide_desktop_artifacts "$r_user" "$user_home" "$idesk" ""
+        done
+    else
+        for ibin in "${installer_bins[@]}"; do
+            [[ -e "$ibin" ]] && setfacl -x "u:${r_user}" "$ibin" 2>/dev/null || true
+        done
+        for idesk in "${installer_desktops[@]}"; do
+            restore_desktop_artifacts "$r_user" "$user_home" "$idesk" ""
+        done
+    fi
+
+    pc_log "INFO" "Enforced application rules and installer lock (lock_installers=${lock_installers}) for '${r_user}'."
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Apps State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_apps_state_json() {
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+apps_cfg = cfg.get("apps", {})
+print(json.dumps({
+    "restricted_user": cfg.get("restricted_user", ""),
+    "lock_installers": bool(apps_cfg.get("lock_installers", False)),
+    "rules": apps_cfg.get("rules", [])
+}))
+' "$PC_CONFIG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+set_app_rule_status() {
+    local target_status="$1" # "block" or "allow"
+
+    if [[ -z "$TARGET_APP" ]]; then
+        pc_emit_error "Missing required --app <name|desktop|binary> flag." 2
+        exit 2
+    fi
+
+    local r_user user_home
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    local meta_json bin_path
+    meta_json="$(resolve_app_metadata "$TARGET_APP" "$user_home")"
+    bin_path="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("binary_path", ""))' "$meta_json")"
+
+    if [[ "$target_status" == "block" ]] && is_protected_binary "$bin_path"; then
+        pc_emit_error "Refusing to block protected core system binary: '${bin_path}'" 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg resolved_name
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    resolved_name="$(python3 -c '
+import json, sys
+
+cfg_path, raw_query, meta_str, new_status, out_path = sys.argv[1:6]
+meta = json.loads(meta_str)
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+apps_cfg = data.setdefault("apps", {"lock_installers": False, "rules": []})
+rules = apps_cfg.get("rules", [])
+
+name = meta.get("name") or raw_query
+desktop_id = meta.get("desktop_id", "")
+binary_path = meta.get("binary_path", "")
+flatpak_id = meta.get("flatpak_id", "")
+
+filtered = []
+for r in rules:
+    if r.get("name", "").lower() == name.lower():
+        continue
+    if desktop_id and r.get("desktop_id", "").lower() == desktop_id.lower():
+        continue
+    if binary_path and r.get("binary_path", "") == binary_path:
+        continue
+    if flatpak_id and r.get("flatpak_id", "").lower() == flatpak_id.lower():
+        continue
+    filtered.append(r)
+
+filtered.append({
+    "app": raw_query,
+    "name": name,
+    "desktop_id": desktop_id,
+    "binary_path": binary_path,
+    "flatpak_id": flatpak_id,
+    "status": new_status
+})
+filtered.sort(key=lambda x: x.get("name", "").lower())
+apps_cfg["rules"] = filtered
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(name)
+' "$PC_CONFIG_FILE" "$TARGET_APP" "$meta_json" "$target_status" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    enforce_app_rules "$r_user"
+    pc_commit_transaction
+
+    local verb="Blocked"
+    [[ "$target_status" == "allow" ]] && verb="Allowed"
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "${verb} application '${resolved_name}' for '${r_user}'" "$state_json"
+}
+
+handle_remove() {
+    if [[ -z "$TARGET_APP" ]]; then
+        pc_emit_error "Action 'remove' requires --app <name|desktop|binary>." 2
+        exit 2
+    fi
+
+    local r_user user_home
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    local meta_json
+    meta_json="$(resolve_app_metadata "$TARGET_APP" "$user_home")"
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg removed_info
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_info="$(python3 -c '
+import json, sys
+
+cfg_path, raw_query, meta_str, out_path = sys.argv[1:5]
+meta = json.loads(meta_str)
+q_low = raw_query.strip().lower()
+m_name = meta.get("name", "").lower()
+m_did = meta.get("desktop_id", "").lower()
+m_bin = meta.get("binary_path", "")
+m_fp = meta.get("flatpak_id", "").lower()
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+apps_cfg = data.setdefault("apps", {"lock_installers": False, "rules": []})
+old_rules = apps_cfg.get("rules", [])
+
+kept = []
+removed = []
+for r in old_rules:
+    r_app = str(r.get("app", "")).lower()
+    r_name = str(r.get("name", "")).lower()
+    r_did = str(r.get("desktop_id", "")).lower()
+    r_bin = str(r.get("binary_path", ""))
+    r_fp = str(r.get("flatpak_id", "")).lower()
+
+    if (q_low in (r_app, r_name, r_did, r_fp) or
+        (m_name and r_name == m_name) or
+        (m_did and r_did == m_did) or
+        (m_bin and r_bin == m_bin) or
+        (m_fp and r_fp == m_fp)):
+        removed.append(r)
+    else:
+        kept.append(r)
+
+apps_cfg["rules"] = kept
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(json.dumps(removed))
+' "$PC_CONFIG_FILE" "$TARGET_APP" "$meta_json" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    local removed_count
+    removed_count="$(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$removed_info")"
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No saved application rule found for '${TARGET_APP}'." 2
+        exit 2
+    fi
+
+# Clean up ACLs and desktop artifacts for each removed rule
+    local cleanup_lines
+    cleanup_lines="$(python3 -c '
+import json, sys
+for r in json.loads(sys.argv[1]):
+    vals = [r.get("name", ""), r.get("desktop_id", ""), r.get("binary_path", ""), r.get("flatpak_id", "")]
+    print("|".join(vals))
+' "$removed_info")"
+
+    while IFS='|' read -r c_name c_did c_bin c_fp; do
+        if [[ -n "$c_fp" ]]; then
+            for fp_dir in "/var/lib/flatpak/app/${c_fp}" "${user_home}/.local/share/flatpak/app/${c_fp}"; do
+                [[ -d "$fp_dir" ]] && setfacl -R -x "u:${r_user}" "$fp_dir" 2>/dev/null || true
+            done
+        elif [[ -n "$c_bin" && -e "$c_bin" ]]; then
+            setfacl -x "u:${r_user}" "$c_bin" 2>/dev/null || true
+        fi
+        restore_desktop_artifacts "$r_user" "$user_home" "$c_did" "$c_name"
+    done <<< "$cleanup_lines"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Removed application rule for '${TARGET_APP}'" "$state_json"
+}
+
+handle_lock_installers() {
+    if [[ "$LOCK_ENABLED" != "true" && "$LOCK_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'lock-installers' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    local r_user
+    r_user="$(get_restricted_user)"
+
+    pc_init_transaction
+    pc_json_set "apps.lock_installers" "$LOCK_ENABLED"
+    enforce_app_rules "$r_user"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Set Software Manager / package installer lock to ${LOCK_ENABLED}" "$state_json"
+}
+
+handle_uninstall() {
+    if [[ -z "$TARGET_APP" ]]; then
+        pc_emit_error "Action 'uninstall' requires --app <name|desktop|binary|package>." 2
+        exit 2
+    fi
+
+    local r_user user_home meta_json bin_path flatpak_id
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+    meta_json="$(resolve_app_metadata "$TARGET_APP" "$user_home")"
+
+    bin_path="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("binary_path", ""))' "$meta_json")"
+    flatpak_id="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("flatpak_id", ""))' "$meta_json")"
+
+    if [[ -n "$flatpak_id" ]] && command -v flatpak >/dev/null 2>&1; then
+        pc_log "INFO" "Uninstalling Flatpak application '${flatpak_id}'..."
+        flatpak uninstall -y --noninteractive "$flatpak_id" >/dev/null
+        local state_json
+        state_json="$(build_apps_state_json)"
+        pc_emit_result "Uninstalled Flatpak package '${flatpak_id}'" "$state_json"
+        return 0
+    fi
+
+    local pkg_name=""
+    if [[ -n "$bin_path" && -e "$bin_path" ]]; then
+        pkg_name="$(dpkg-query -S "$bin_path" 2>/dev/null | head -n 1 | cut -d: -f1 || true)"
+    fi
+    if [[ -z "$pkg_name" ]] && dpkg-query -W -f='${Status}\n' "$TARGET_APP" 2>/dev/null | grep -q "install ok installed"; then
+        pkg_name="$TARGET_APP"
+    fi
+
+    if [[ -z "$pkg_name" ]]; then
+        pc_emit_error "Could not map '${TARGET_APP}' to an installed APT or Flatpak package." 2
+        exit 2
+    fi
+
+    # Guard critical Linux Mint / Cinnamon system packages
+    case "$pkg_name" in
+        mint-meta-*|mintsystem|mintdesktop|cinnamon*|lightdm*|slick-greeter|\
+        systemd*|xorg*|xserver-*|ubuntu-minimal|bash|coreutils|dpkg|apt|\
+        python3|python3-minimal|sudo|policykit-1|polkitd|acl|ufw)
+            pc_emit_error "Refusing to uninstall protected system package: '${pkg_name}'" 2
+            exit 2
+            ;;
+    esac
+
+    pc_log "INFO" "Uninstalling APT package '${pkg_name}'..."
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq "$pkg_name" >/dev/null
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Uninstalled APT package '${pkg_name}'" "$state_json"
+}
+
+handle_scan() {
+    pc_ensure_config_exists
+    python3 -c '
+import glob, json, os, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+rules_by_name = {}
+rules_by_did = {}
+for r in cfg.get("apps", {}).get("rules", []):
+    st = r.get("status", "allow")
+    if r.get("name"):
+        rules_by_name[r["name"].lower()] = st
+    if r.get("desktop_id"):
+        rules_by_did[r["desktop_id"].lower()] = st
+
+apps = {}
+for d in ("/usr/share/applications", "/usr/local/share/applications", "/var/lib/flatpak/exports/share/applications"):
+    if not os.path.isdir(d):
+        continue
+    for fp in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+        did = os.path.basename(fp)
+        name = ""
+        exec_cmd = ""
+        no_display = False
+        try:
+            with open(fp, "r", encoding="utf-8", errors="replace") as df:
+                in_main = False
+                for line in df:
+                    s = line.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        in_main = (s == "[Desktop Entry]")
+                        continue
+                    if not in_main or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    if k == "Name" and not name:
+                        name = v.strip()
+                    elif k == "Exec" and not exec_cmd:
+                        exec_cmd = v.strip()
+                    elif k in ("NoDisplay", "Hidden") and v.strip().lower() == "true":
+                        no_display = True
+        except Exception:
+            continue
+        if not name or no_display:
+            continue
+        if name not in apps:
+            status = rules_by_did.get(did.lower()) or rules_by_name.get(name.lower()) or "allow"
+            apps[name] = {
+                "name": name,
+                "desktop_id": did,
+                "exec": exec_cmd,
+                "status": status
+            }
+
+sorted_apps = [apps[k] for k in sorted(apps.keys(), key=str.lower)]
+out = {
+    "status": "ok",
+    "module": "apps",
+    "action": "scan",
+    "message": f"Scanned {len(sorted_apps)} installed desktop applications",
+    "data": {"count": len(sorted_apps), "applications": sorted_apps}
+}
+print(json.dumps(out))
+' "$PC_CONFIG_FILE"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Retrieved application governance rules" "$state_json"
+}
+
+handle_apply() {
+    local r_user
+    r_user="$(get_restricted_user)"
+
+    pc_init_transaction
+    enforce_app_rules "$r_user"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Applied all application governance rules for '${r_user}'" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_apps_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$APPS_ACTION" in
+        block)
+            set_app_rule_status "block"
+            ;;
+        allow|unblock)
+            set_app_rule_status "allow"
+            ;;
+        set)
+            case "$TARGET_STATUS" in
+                block) set_app_rule_status "block" ;;
+                allow) set_app_rule_status "allow" ;;
+                *)
+                    pc_emit_error "Action 'set' requires --status <Allow|Block>." 2
+                    exit 2
+                    ;;
+            esac
+            ;;
+        remove)
+            handle_remove
+            ;;
+        lock-installers)
+            handle_lock_installers
+            ;;
+        uninstall)
+            handle_uninstall
+            ;;
+        scan)
+            handle_scan
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${APPS_ACTION}' (expected: block, allow, set, remove, lock-installers, uninstall, scan, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_APPS_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-apps.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-apps.sh
+}
+
+# ------------------------------------------------------------------------------
 # Deploy Initial Master Configuration (/etc/parentcontrol/config.json)
 # ------------------------------------------------------------------------------
 deploy_initial_config() {
@@ -3459,7 +4401,6 @@ deploy_initial_config() {
         pc_ensure_config_exists
     '
 }
-
 
 # ------------------------------------------------------------------------------
 # Automated Verification Self-Test
@@ -3478,6 +4419,7 @@ run_self_test() {
     /opt/parentcontrol/bin/pc-ctl.sh perms --action list "${test_flags[@]}"
     /opt/parentcontrol/bin/pc-ctl.sh ports --action list "${test_flags[@]}"
     /opt/parentcontrol/bin/pc-ctl.sh devices --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh apps --action list "${test_flags[@]}"
 }
 
 # ------------------------------------------------------------------------------
@@ -3495,12 +4437,13 @@ main() {
     deploy_pc_perms_sh
     deploy_pc_ports_sh
     deploy_pc_devices_sh
+    deploy_pc_apps_sh
     deploy_initial_config
 
     if [[ "$SKIP_TEST" -eq 0 ]]; then
         run_self_test
     else
-        printf '[OK] ParentControl Sub-Chunk 4.2 deployed (self-test skipped).\n'
+        printf '[OK] ParentControl Part 5 deployed (self-test skipped).\n'
     fi
 }
 
