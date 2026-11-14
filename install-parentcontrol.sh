@@ -1972,6 +1972,9 @@ get_restricted_user() {
     local r_user
     r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
     if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
+        r_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $1 != "pcadmin" {print $1; exit}' /etc/passwd)"
+    fi
+    if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
         pc_emit_error "Valid restricted_user is not configured in config.json." 2
         exit 2
     fi
@@ -2053,29 +2056,93 @@ apply_single_acl_rule() {
     local r_user="$1"
     local target_path="$2"
     local rwx="$3"
-    local acl_str
-    acl_str="$(printf '%s' "$rwx" | tr '[:upper:]' '[:lower:]')"
+    local orig_owner="${4:-$r_user}"
+    local orig_group="${5:-$(id -gn "$r_user")}"
 
     [[ -e "$target_path" ]] || return 0
 
-    if [[ -d "$target_path" ]]; then
-        setfacl -R -m "u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
-        setfacl -R -m "d:u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
-    else
-        setfacl -m "u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
-    fi
+    case "$rwx" in
+        "---")
+            # Complete lockdown: root owns path, non-owners have zero base bits, explicit --- ACL
+            chown -R root:root "$target_path"
+            chmod -R go-rwx "$target_path"
+            setfacl -R -b "$target_path" 2>/dev/null || true
+            setfacl -R -m "u:${r_user}:---" "$target_path" 2>/dev/null || true
+            if [[ -d "$target_path" ]]; then
+                setfacl -R -m "d:u:${r_user}:---" "$target_path" 2>/dev/null || true
+            fi
+            ;;
+        "R-X")
+            # Read-only: root owns path so user cannot chmod/delete; user gets r-X via ACL
+            chown -R root:root "$target_path"
+            if [[ -d "$target_path" ]]; then
+                find "$target_path" -type d -exec chmod 0750 {} +
+                find "$target_path" -type f -exec chmod 0640 {} +
+                setfacl -R -b "$target_path" 2>/dev/null || true
+                setfacl -R -m "u:${r_user}:r-X" "$target_path"
+                setfacl -R -m "d:u:${r_user}:r-X" "$target_path"
+                setfacl -R -m "m::r-X" "$target_path"
+            else
+                chmod 0640 "$target_path"
+                setfacl -b "$target_path" 2>/dev/null || true
+                setfacl -m "u:${r_user}:r--" "$target_path"
+                setfacl -m "m::r--" "$target_path"
+            fi
+            ;;
+        "-WX")
+            # Drop-box: user can write/create files in directory, cannot list or read existing files
+            chown -R root:root "$target_path"
+            if [[ -d "$target_path" ]]; then
+                find "$target_path" -type d -exec chmod 0750 {} +
+                find "$target_path" -type f -exec chmod 0640 {} +
+                setfacl -R -b "$target_path" 2>/dev/null || true
+                setfacl -m "u:${r_user}:-wx" "$target_path"
+                setfacl -m "d:u:${r_user}:rw-" "$target_path"
+                setfacl -m "m::rwx" "$target_path"
+            else
+                chmod 0640 "$target_path"
+                setfacl -b "$target_path" 2>/dev/null || true
+                setfacl -m "u:${r_user}:-w-" "$target_path"
+                setfacl -m "m::-w-" "$target_path"
+            fi
+            ;;
+        "RWX")
+            # Full access: restore original user ownership and clear restriction ACLs
+            setfacl -R -b "$target_path" 2>/dev/null || true
+            chown -R "${orig_owner}:${orig_group}" "$target_path"
+            if [[ -d "$target_path" ]]; then
+                find "$target_path" -type d -exec chmod 0755 {} +
+                find "$target_path" -type f -exec chmod 0644 {} +
+            else
+                chmod 0644 "$target_path"
+            fi
+            ;;
+        *)
+            local acl_str
+            acl_str="$(printf '%s' "$rwx" | tr '[:upper:]' '[:lower:]')"
+            chown -R root:root "$target_path"
+            chmod -R go-rwx "$target_path"
+            setfacl -R -b "$target_path" 2>/dev/null || true
+            setfacl -R -m "u:${r_user}:${acl_str}" "$target_path"
+            if [[ -d "$target_path" ]]; then
+                setfacl -R -m "d:u:${r_user}:${acl_str}" "$target_path"
+            fi
+            ;;
+    esac
 }
 
 enforce_all_perms() {
     local r_user="$1"
-    local user_home
+    local user_home r_group
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+    r_group="$(id -gn "$r_user")"
     pc_ensure_config_exists
 
     local dump
-    dump="$(python3 - "$PC_CONFIG_FILE" << 'PYEOF'
+    dump="$(python3 - "$PC_CONFIG_FILE" "$r_user" "$r_group" << 'PYEOF'
 import json, sys
 cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+def_owner, def_group = sys.argv[2], sys.argv[3]
 perms = cfg.get("permissions", {})
 presets = perms.get("presets", {})
 print("PRESET|lock_dotfiles|" + ("1" if presets.get("lock_dotfiles") else "0"))
@@ -2084,18 +2151,20 @@ print("PRESET|noexec_user_dirs|" + ("1" if presets.get("noexec_user_dirs") else 
 for r in perms.get("custom_rules", []):
     p_val = r.get("path", "")
     r_val = r.get("perms", "R-X")
-    print(f"RULE|{p_val}|{r_val}")
+    o_val = r.get("orig_owner") or def_owner
+    g_val = r.get("orig_group") or def_group
+    print(f"RULE|{p_val}|{r_val}|{o_val}|{g_val}")
 PYEOF
 )"
 
     local lock_dot="0" restrict_extra="0" noexec_dirs="0"
-    while IFS='|' read -r kind a b; do
+    while IFS='|' read -r kind a b c d; do
         if [[ "$kind" == "PRESET" ]]; then
             [[ "$a" == "lock_dotfiles" ]] && lock_dot="$b"
             [[ "$a" == "restrict_extra_home_dirs" ]] && restrict_extra="$b"
             [[ "$a" == "noexec_user_dirs" ]] && noexec_dirs="$b"
         elif [[ "$kind" == "RULE" && -n "$a" ]]; then
-            apply_single_acl_rule "$r_user" "$a" "$b"
+            apply_single_acl_rule "$r_user" "$a" "$b" "$c" "$d"
         fi
     done <<< "$dump"
 
@@ -2106,15 +2175,26 @@ PYEOF
                 chown root:root "$fpath"
                 chmod 0644 "$fpath"
             else
-                chown "${r_user}:$(id -gn "$r_user")" "$fpath"
+                chown "${r_user}:${r_group}" "$fpath"
+                chmod 0644 "$fpath"
             fi
+        fi
+    done
+
+    for hdir in /home/*; do
+        [[ -d "$hdir" ]] || continue
+        [[ "$hdir" == "$user_home" ]] && continue
+        if [[ "$restrict_extra" == "1" ]]; then
+            setfacl -m "u:${r_user}:---" "$hdir" 2>/dev/null || true
+        else
+            setfacl -x "u:${r_user}" "$hdir" 2>/dev/null || true
         fi
     done
 
     if [[ "$noexec_dirs" == "1" ]]; then
         for d in "${user_home}/Downloads" "${user_home}/Desktop" "/tmp"; do
-            [[ -d "$d" ]] && setfacl -R -m "u:${r_user}:rw-" "$d" 2>/dev/null || true
-            [[ -d "$d" ]] && setfacl -m "u:${r_user}:rwx" "$d" 2>/dev/null || true
+            [[ -d "$d" ]] || continue
+            find "$d" -maxdepth 4 -type f -user "$r_user" -exec chmod a-x {} + 2>/dev/null || true
         done
     fi
 }
@@ -2160,33 +2240,62 @@ handle_set() {
     norm_info="$(normalize_rwx_and_label "$TARGET_MODE" "$TARGET_PERMS" "$resolved_path")"
     IFS='|' read -r rwx_val mode_label <<< "$norm_info"
 
+    local cur_owner cur_group
+    cur_owner="$(stat -c '%U' "$resolved_path")"
+    cur_group="$(stat -c '%G' "$resolved_path")"
+    [[ "$cur_owner" == "root" ]] && cur_owner="$r_user"
+    [[ "$cur_group" == "root" ]] && cur_group="$(id -gn "$r_user")"
+
     pc_init_transaction
     pc_backup_file "$PC_CONFIG_FILE"
 
-    local tmp_cfg
+    local tmp_cfg owner_pair
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
 
-    python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$tmp_cfg" << 'PYEOF'
+    owner_pair="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$cur_owner" "$cur_group" "$tmp_cfg" << 'PYEOF'
 import json, sys
 
-cfg_path, path_val, rwx_str, label_str, out_path = sys.argv[1:6]
+cfg_path, path_val, rwx_str, label_str, def_o, def_g, out_path = sys.argv[1:8]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
 perms = data.setdefault("permissions", {"presets": {}, "custom_rules": []})
-rules = [r for r in perms.get("custom_rules", []) if r.get("path") != path_val]
-rules.append({"path": path_val, "perms": rwx_str, "label": label_str})
-rules.sort(key=lambda x: x.get("path", ""))
-perms["custom_rules"] = rules
+
+orig_o, orig_g = def_o, def_g
+kept = []
+for r in perms.get("custom_rules", []):
+    if r.get("path") == path_val:
+        if r.get("orig_owner") and r.get("orig_owner") != "root":
+            orig_o = r["orig_owner"]
+        if r.get("orig_group") and r.get("orig_group") != "root":
+            orig_g = r["orig_group"]
+    else:
+        kept.append(r)
+
+kept.append({
+    "path": path_val,
+    "perms": rwx_str,
+    "label": label_str,
+    "orig_owner": orig_o,
+    "orig_group": orig_g
+})
+kept.sort(key=lambda x: x.get("path", ""))
+perms["custom_rules"] = kept
 
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
+
+print(f"{orig_o}|{orig_g}")
 PYEOF
+)"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
     mv "$tmp_cfg" "$PC_CONFIG_FILE"
 
-    apply_single_acl_rule "$r_user" "$resolved_path" "$rwx_val"
+    local saved_owner saved_group
+    IFS='|' read -r saved_owner saved_group <<< "$owner_pair"
+
+    apply_single_acl_rule "$r_user" "$resolved_path" "$rwx_val" "$saved_owner" "$saved_group"
     pc_commit_transaction
 
     pc_emit_result "Set permissions on '${resolved_path}' to ${mode_label} (${rwx_val})" "$(build_perms_state_json)"
@@ -2203,20 +2312,30 @@ handle_remove() {
     pc_init_transaction
     pc_backup_file "$PC_CONFIG_FILE"
 
-    local tmp_cfg removed
+    local tmp_cfg removed_info
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
-    removed="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg" << 'PYEOF'
+    removed_info="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$r_user" "$(id -gn "$r_user")" "$tmp_cfg" << 'PYEOF'
 import json, sys
-cfg_path, p_val, out_path = sys.argv[1:4]
+cfg_path, p_val, def_o, def_g, out_path = sys.argv[1:6]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
 perms = data.setdefault("permissions", {"presets": {}, "custom_rules": []})
 old = perms.get("custom_rules", [])
-new = [r for r in old if r.get("path") != p_val]
+new = []
+orig_o, orig_g = def_o, def_g
+found = False
+for r in old:
+    if r.get("path") == p_val:
+        found = True
+        orig_o = r.get("orig_owner") or def_o
+        orig_g = r.get("orig_group") or def_g
+    else:
+        new.append(r)
+
 perms["custom_rules"] = new
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-print("1" if len(new) != len(old) else "0")
+print(("1" if found else "0") + f"|{orig_o}|{orig_g}")
 PYEOF
 )"
 
@@ -2224,16 +2343,16 @@ PYEOF
     chmod 0640 "$tmp_cfg"
     mv "$tmp_cfg" "$PC_CONFIG_FILE"
 
-    if [[ "$removed" != "1" ]]; then
+    local was_removed orig_owner orig_group
+    IFS='|' read -r was_removed orig_owner orig_group <<< "$removed_info"
+
+    if [[ "$was_removed" != "1" ]]; then
         pc_commit_transaction
         pc_emit_error "No saved permission rule found for '${resolved_path}'." 2
         exit 2
     fi
 
-    if [[ -e "$resolved_path" ]]; then
-        setfacl -R -x "u:${r_user}" "$resolved_path" 2>/dev/null || true
-        setfacl -R -x "d:u:${r_user}" "$resolved_path" 2>/dev/null || true
-    fi
+    apply_single_acl_rule "$r_user" "$resolved_path" "RWX" "$orig_owner" "$orig_group"
 
     pc_commit_transaction
     pc_emit_result "Removed permission rule for '${resolved_path}'" "$(build_perms_state_json)"
