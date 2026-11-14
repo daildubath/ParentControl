@@ -1381,6 +1381,1293 @@ PC_SETUP_SH_EOF
 }
 
 # ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-net-acl.sh (Sub-Chunk 2.1)
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-net-acl.sh (Sub-Chunks 2.1 & 2.2)
+# ------------------------------------------------------------------------------
+deploy_pc_net_acl_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-net-acl.sh..."
+
+    cat << 'PC_NET_ACL_SH_EOF' > /opt/parentcontrol/bin/pc-net-acl.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Network & Web Access Control List (ACL) Manager
+# File: /opt/parentcontrol/bin/pc-net-acl.sh
+#
+# Description:
+#   Manages custom domain/URL/IP whitelists and blacklists plus Pi-hole/hosts
+#   blocklist feeds in config.json, enforcing them across /etc/hosts, browser
+#   enterprise policies (Firefox, Chromium, Brave), and UFW (for raw IPs).
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh acl --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     add         --list <whitelist|blacklist> --target <url|domain|ip> --json
+#     remove      [--list <whitelist|blacklist>] --target <url|domain|ip> --json
+#     list        --json
+#     apply       --json
+#     sync        [--url <feed_url>] --json
+#     add-feed    --url <feed_url> --json
+#     remove-feed --url <feed_url> --json
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="acl"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages domain/URL/IP ACLs and Pi-hole blocklist feeds across /etc/hosts and browser policies."
+PC_SCRIPT_USAGE="pc-net-acl.sh --action <add|remove|list|apply|sync|add-feed|remove-feed> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         add, remove, list, apply, sync, add-feed, remove-feed
+      --list <type>           Target list for add/remove: whitelist or blacklist
+      --target <url|domain>   Domain, full URL, or IPv4/IPv6 address
+      --url <feed_url>        Hosts/Pi-hole blocklist URL for sync/add-feed/remove-feed"
+
+readonly PC_FEED_CACHE_FILE="${PC_VAR_DIR}/feed-domains.cache"
+
+ACL_ACTION=""
+ACL_LIST=""
+ACL_TARGET=""
+ACL_FEED_URL=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_acl_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                ACL_ACTION="${2:-}"
+                shift 2
+                ;;
+            --list)
+                ACL_LIST="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --target)
+                ACL_TARGET="${2:-}"
+                shift 2
+                ;;
+            --url)
+                ACL_FEED_URL="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-net-acl.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$ACL_ACTION" ]]; then
+        pc_emit_error "Missing required --action <add|remove|list|apply|sync|add-feed|remove-feed>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$ACL_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Normalize & Validate Target (URL, Domain, or IP)
+# Emits "<kind>|<normalized_value>" where kind is "domain" or "ip"
+# ------------------------------------------------------------------------------
+normalize_target() {
+    local raw_input="$1"
+
+    python3 -c '
+import ipaddress, re, sys
+from urllib.parse import urlparse
+
+raw = sys.argv[1].strip()
+if not raw:
+    sys.exit(1)
+
+candidate = raw
+if "://" in candidate:
+    parsed = urlparse(candidate)
+    candidate = parsed.hostname or ""
+else:
+    candidate = candidate.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if candidate.count(":") == 1 and not candidate.startswith("["):
+        candidate = candidate.split(":", 1)[0]
+
+candidate = candidate.strip().strip(".").lower()
+if candidate.startswith("*."):
+    candidate = candidate[2:]
+
+# Normalize www.<domain> to root <domain> (while keeping other subdomains intact)
+if candidate.startswith("www.") and candidate.count(".") >= 2:
+    candidate = candidate[4:]
+
+if not candidate:
+    sys.exit(1)
+
+try:
+    ip_obj = ipaddress.ip_address(candidate)
+    print(f"ip|{ip_obj.compressed}")
+    sys.exit(0)
+except ValueError:
+    pass
+
+if len(candidate) > 253 or "." not in candidate:
+    sys.exit(1)
+
+labels = candidate.split(".")
+label_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+if any(not label_re.match(lbl) for lbl in labels):
+    sys.exit(1)
+
+print(f"domain|{candidate}")
+' "$raw_input"
+}
+
+# ------------------------------------------------------------------------------
+# Enforce Current ACL Rules & Cached Feeds to /etc/hosts, Browsers, and UFW
+# ------------------------------------------------------------------------------
+enforce_acl_rules() {
+    pc_ensure_config_exists
+
+    pc_backup_file "$PC_HOSTS_FILE"
+    pc_backup_file "/etc/firefox/policies/policies.json"
+    pc_backup_file "/etc/chromium/policies/managed/parentcontrol.json"
+    pc_backup_file "/etc/brave/policies/managed/parentcontrol.json"
+
+    mkdir -p /etc/firefox/policies \
+             /etc/chromium/policies/managed \
+             /etc/brave/policies/managed
+
+    local tmp_hosts
+    tmp_hosts="$(mktemp /tmp/pc-hosts.XXXXXX)"
+
+    local ip_actions
+    ip_actions="$(python3 -c '
+import ipaddress, json, os, sys
+
+cfg_path, hosts_path, tmp_hosts_path, feed_cache_path, begin_marker, end_marker = sys.argv[1:7]
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+acl = cfg.get("acl", {})
+whitelist = sorted(set(x.strip().lower() for x in acl.get("whitelist", []) if x.strip()))
+blacklist = sorted(set(x.strip().lower() for x in acl.get("blacklist", []) if x.strip()))
+
+# Expand whitelist with www. variants so whitelisting example.com also unblocks www.example.com
+wl_expanded = set()
+for item in whitelist:
+    wl_expanded.add(item)
+    if not item.startswith("www.") and "." in item:
+        wl_expanded.add(f"www.{item}")
+
+effective_blacklist = [item for item in blacklist if item not in wl_expanded]
+
+def is_ip(val):
+    try:
+        ipaddress.ip_address(val)
+        return True
+    except ValueError:
+        return False
+
+bl_domains = [d for d in effective_blacklist if not is_ip(d)]
+bl_ips = [i for i in effective_blacklist if is_ip(i)]
+
+# 1. Build /etc/hosts managed section (custom blacklist + cached Pi-hole feed domains)
+host_entries = []
+seen_hosts = set()
+
+for dom in bl_domains:
+    variants = [dom]
+    if not dom.startswith("www."):
+        variants.append(f"www.{dom}")
+    for v in variants:
+        if v not in wl_expanded and v not in seen_hosts:
+            seen_hosts.add(v)
+            host_entries.append(f"0.0.0.0 {v}")
+
+if os.path.isfile(feed_cache_path):
+    with open(feed_cache_path, "r", encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            dom = raw_line.strip().lower()
+            if not dom or dom in wl_expanded or dom in seen_hosts:
+                continue
+            seen_hosts.add(dom)
+            host_entries.append(f"0.0.0.0 {dom}")
+
+existing_lines = []
+if os.path.exists(hosts_path):
+    with open(hosts_path, "r", encoding="utf-8", errors="replace") as f:
+        in_block = False
+        for line in f:
+            stripped = line.rstrip("\r\n")
+            if stripped == begin_marker:
+                in_block = True
+                continue
+            if stripped == end_marker:
+                in_block = False
+                continue
+            if not in_block:
+                existing_lines.append(stripped)
+
+while existing_lines and existing_lines[-1] == "":
+    existing_lines.pop()
+
+out_lines = list(existing_lines)
+if host_entries:
+    out_lines.append("")
+    out_lines.append(begin_marker)
+    out_lines.extend(host_entries)
+    out_lines.append(end_marker)
+
+with open(tmp_hosts_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out_lines) + "\n")
+
+# 2. Update Firefox Enterprise Policy (/etc/firefox/policies/policies.json)
+ff_policy_path = "/etc/firefox/policies/policies.json"
+ff_data = {"policies": {}}
+if os.path.exists(ff_policy_path):
+    try:
+        with open(ff_policy_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                ff_data = loaded
+    except Exception:
+        ff_data = {"policies": {}}
+
+ff_data.setdefault("policies", {})
+if effective_blacklist or whitelist:
+    ff_patterns_block = []
+    for item in effective_blacklist:
+        if is_ip(item):
+            ff_patterns_block.append(f"*://{item}/*")
+        else:
+            ff_patterns_block.append(f"*://*.{item}/*")
+            ff_patterns_block.append(f"*://{item}/*")
+    ff_patterns_allow = []
+    for item in whitelist:
+        if is_ip(item):
+            ff_patterns_allow.append(f"*://{item}/*")
+        else:
+            ff_patterns_allow.append(f"*://*.{item}/*")
+            ff_patterns_allow.append(f"*://{item}/*")
+    ff_data["policies"]["WebsiteFilter"] = {
+        "Block": ff_patterns_block[:1000],
+        "Exceptions": ff_patterns_allow[:1000]
+    }
+else:
+    ff_data["policies"].pop("WebsiteFilter", None)
+
+with open(ff_policy_path, "w", encoding="utf-8") as f:
+    json.dump(ff_data, f, indent=2)
+    f.write("\n")
+
+# 3. Update Chromium & Brave Enterprise Policies
+for chromium_path in (
+    "/etc/chromium/policies/managed/parentcontrol.json",
+    "/etc/brave/policies/managed/parentcontrol.json"
+):
+    c_data = {}
+    if os.path.exists(chromium_path):
+        try:
+            with open(chromium_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    c_data = loaded
+        except Exception:
+            c_data = {}
+
+    if effective_blacklist:
+        c_data["URLBlocklist"] = effective_blacklist
+    else:
+        c_data.pop("URLBlocklist", None)
+
+    if whitelist:
+        c_data["URLAllowlist"] = whitelist
+    else:
+        c_data.pop("URLAllowlist", None)
+
+    with open(chromium_path, "w", encoding="utf-8") as f:
+        json.dump(c_data, f, indent=2)
+        f.write("\n")
+
+print(json.dumps({"blocked_ips": bl_ips, "total_hosts_blocked": len(host_entries)}))
+' "$PC_CONFIG_FILE" "$PC_HOSTS_FILE" "$tmp_hosts" "$PC_FEED_CACHE_FILE" "$PC_HOSTS_BEGIN_MARKER" "$PC_HOSTS_END_MARKER")"
+
+    chown root:root "$tmp_hosts"
+    chmod 0644 "$tmp_hosts"
+    mv "$tmp_hosts" "$PC_HOSTS_FILE"
+
+    chmod 0644 /etc/firefox/policies/policies.json \
+               /etc/chromium/policies/managed/parentcontrol.json \
+               /etc/brave/policies/managed/parentcontrol.json
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        local ip_list
+        ip_list="$(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1]).get("blocked_ips", [])))' "$ip_actions")"
+        while IFS= read -r ip_addr; do
+            [[ -z "$ip_addr" ]] && continue
+            ufw deny out to "$ip_addr" comment "ParentControl-ACL" >/dev/null 2>&1 || true
+        done <<< "$ip_list"
+    fi
+
+    if command -v resolvectl >/dev/null 2>&1; then
+        resolvectl flush-caches >/dev/null 2>&1 || true
+    fi
+
+    pc_log "INFO" "Enforced ACL rules across /etc/hosts and browser policies."
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized ACL State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_acl_state_json() {
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, os, sys
+
+cfg_path, feed_cache_path = sys.argv[1:3]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+acl = cfg.get("acl", {})
+wl = sorted(set(acl.get("whitelist", [])))
+bl = sorted(set(acl.get("blacklist", [])))
+feeds = acl.get("feeds", [])
+
+feed_count = 0
+if os.path.isfile(feed_cache_path):
+    with open(feed_cache_path, "r", encoding="utf-8", errors="replace") as f:
+        feed_count = sum(1 for line in f if line.strip())
+
+rules = [{"list": "whitelist", "target": item} for item in wl]
+rules.extend({"list": "blacklist", "target": item} for item in bl)
+
+print(json.dumps({
+    "whitelist": wl,
+    "blacklist": bl,
+    "rules": rules,
+    "feeds": feeds,
+    "feed_domains_count": feed_count
+}))
+' "$PC_CONFIG_FILE" "$PC_FEED_CACHE_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_add() {
+    if [[ "$ACL_LIST" != "whitelist" && "$ACL_LIST" != "blacklist" ]]; then
+        pc_emit_error "Action 'add' requires --list <whitelist|blacklist>." 2
+        exit 2
+    fi
+
+    if [[ -z "$ACL_TARGET" ]]; then
+        pc_emit_error "Action 'add' requires --target <url|domain|ip>." 2
+        exit 2
+    fi
+
+    local norm_pair kind normalized
+    if ! norm_pair="$(normalize_target "$ACL_TARGET")"; then
+        pc_emit_error "Invalid domain, URL, or IP address: '${ACL_TARGET}'" 2
+        exit 2
+    fi
+    IFS='|' read -r kind normalized <<< "$norm_pair"
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, target_list, normalized, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+acl = data.setdefault("acl", {})
+wl = set(acl.get("whitelist", []))
+bl = set(acl.get("blacklist", []))
+
+if target_list == "whitelist":
+    bl.discard(normalized)
+    bl.discard(f"www.{normalized}")
+    wl.add(normalized)
+else:
+    wl.discard(normalized)
+    wl.discard(f"www.{normalized}")
+    bl.add(normalized)
+
+acl["whitelist"] = sorted(wl)
+acl["blacklist"] = sorted(bl)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$ACL_LIST" "$normalized" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Added '${normalized}' (${kind}) to ${ACL_LIST}" "$state_json"
+}
+
+handle_remove() {
+    if [[ -n "$ACL_LIST" && "$ACL_LIST" != "whitelist" && "$ACL_LIST" != "blacklist" ]]; then
+        pc_emit_error "--list must be 'whitelist' or 'blacklist' (got: '${ACL_LIST}')." 2
+        exit 2
+    fi
+
+    if [[ -z "$ACL_TARGET" ]]; then
+        pc_emit_error "Action 'remove' requires --target <url|domain|ip>." 2
+        exit 2
+    fi
+
+    local norm_pair kind normalized
+    if ! norm_pair="$(normalize_target "$ACL_TARGET")"; then
+        normalized="$(printf '%s' "$ACL_TARGET" | tr '[:upper:]' '[:lower:]' | xargs)"
+        kind="domain"
+    else
+        IFS='|' read -r kind normalized <<< "$norm_pair"
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg removed_count
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_count="$(python3 -c '
+import json, sys
+
+cfg_path, target_list, normalized, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+acl = data.setdefault("acl", {})
+wl = set(acl.get("whitelist", []))
+bl = set(acl.get("blacklist", []))
+
+candidates = {normalized, f"www.{normalized}"}
+removed = 0
+for cand in candidates:
+    if target_list in ("", "whitelist") and cand in wl:
+        wl.remove(cand)
+        removed += 1
+    if target_list in ("", "blacklist") and cand in bl:
+        bl.remove(cand)
+        removed += 1
+
+acl["whitelist"] = sorted(wl)
+acl["blacklist"] = sorted(bl)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(removed)
+' "$PC_CONFIG_FILE" "$ACL_LIST" "$normalized" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "Target '${normalized}' was not found in ACL rules." 2
+        exit 2
+    fi
+
+    if [[ "$kind" == "ip" ]] && command -v ufw >/dev/null 2>&1; then
+        ufw delete deny out to "$normalized" >/dev/null 2>&1 || true
+    fi
+
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Removed '${normalized}' from ACL" "$state_json"
+}
+
+handle_sync() {
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_FEED_CACHE_FILE"
+
+    local tmp_cache sync_stats
+    tmp_cache="$(mktemp /tmp/pc-feed-cache.XXXXXX)"
+
+    if ! sync_stats="$(python3 -c '
+import json, re, sys, urllib.request
+
+cfg_path, override_url, out_cache_path = sys.argv[1:4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+feeds = [override_url.strip()] if override_url.strip() else cfg.get("acl", {}).get("feeds", [])
+if not feeds:
+    sys.stderr.write("No blocklist feed URLs configured.\n")
+    sys.exit(2)
+
+ignore_hosts = {
+    "localhost", "localhost.localdomain", "local", "broadcasthost",
+    "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
+    "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0", "127.0.0.1"
+}
+domain_re = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+domains = set()
+synced_feeds = 0
+
+for url in feeds:
+    if not url.startswith(("http://", "https://")):
+        continue
+    req = urllib.request.Request(url, headers={"User-Agent": "ParentControl/0.1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        for raw_bytes in resp:
+            line = raw_bytes.decode("utf-8", errors="ignore").split("#", 1)[0].strip().lower()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1"):
+                cand = parts[1].strip(".")
+            elif len(parts) == 1:
+                cand = parts[0].strip(".")
+            else:
+                continue
+            if cand in ignore_hosts or len(cand) > 253:
+                continue
+            if domain_re.match(cand):
+                domains.add(cand)
+    synced_feeds += 1
+
+sorted_domains = sorted(domains)
+with open(out_cache_path, "w", encoding="utf-8") as f:
+    if sorted_domains:
+        f.write("\n".join(sorted_domains) + "\n")
+
+print(json.dumps({"synced_feeds": synced_feeds, "cached_domains": len(sorted_domains)}))
+' "$PC_CONFIG_FILE" "$ACL_FEED_URL" "$tmp_cache")"; then
+        rm -f "$tmp_cache"
+        pc_rollback
+        pc_emit_error "Failed to download or parse blocklist feed(s)." 1
+        exit 1
+    fi
+
+    chown root:root "$tmp_cache"
+    chmod 0644 "$tmp_cache"
+    mv "$tmp_cache" "$PC_FEED_CACHE_FILE"
+
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Synchronized Pi-hole blocklist feeds (${sync_stats})" "$state_json"
+}
+
+handle_feed_config() {
+    local mode="$1" # "add" or "remove"
+    if [[ -z "$ACL_FEED_URL" ]]; then
+        pc_emit_error "Action '${mode}-feed' requires --url <http(s)://...>." 2
+        exit 2
+    fi
+
+    if [[ "$mode" == "add" && ! "$ACL_FEED_URL" =~ ^https?:// ]]; then
+        pc_emit_error "Feed URL must begin with http:// or https:// (got: '${ACL_FEED_URL}')." 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, mode, feed_url, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+acl = data.setdefault("acl", {})
+feeds = list(dict.fromkeys(acl.get("feeds", [])))
+
+if mode == "add":
+    if feed_url not in feeds:
+        feeds.append(feed_url)
+else:
+    feeds = [u for u in feeds if u != feed_url]
+
+acl["feeds"] = feeds
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$mode" "$ACL_FEED_URL" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Updated blocklist feed list (${mode}: ${ACL_FEED_URL})" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Retrieved network ACL rules" "$state_json"
+}
+
+handle_apply() {
+    pc_init_transaction
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Applied network ACL rules to system and browsers" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_acl_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$ACL_ACTION" in
+        add)
+            handle_add
+            ;;
+        remove)
+            handle_remove
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        sync)
+            handle_sync
+            ;;
+        add-feed)
+            handle_feed_config "add"
+            ;;
+        remove-feed)
+            handle_feed_config "remove"
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${ACL_ACTION}' (expected: add, remove, list, apply, sync, add-feed, remove-feed)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_NET_ACL_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-net-acl.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-net-acl.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-perms.sh (Part 3)
+# ------------------------------------------------------------------------------
+deploy_pc_perms_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-perms.sh..."
+
+    cat << 'PC_PERMS_SH_EOF' > /opt/parentcontrol/bin/pc-perms.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Directory Permissions & RWX Enforcement Manager
+# File: /opt/parentcontrol/bin/pc-perms.sh
+#
+# Description:
+#   Enforces per-folder Read/Write/Execute (RWX) rules via POSIX ACLs (setfacl)
+#   and manages home-directory hardening presets (lock_dotfiles,
+#   restrict_extra_home_dirs, noexec_user_dirs) for the restricted user.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh perms --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     set     --path <target_path> --perms <RWX|R-X|R--|---> [--recursive] --json
+#     remove  --path <target_path> --json
+#     preset  --name <lock_dotfiles|restrict_extra_home_dirs|noexec_user_dirs> --enabled <true|false> --json
+#     list    --json
+#     apply   --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "restricted_user": "mint",
+#       "presets": {
+#         "lock_dotfiles": false,
+#         "restrict_extra_home_dirs": false,
+#         "noexec_user_dirs": false
+#       },
+#       "custom_rules": [
+#         {"path": "/home/mint/Private", "perms": "R--", "recursive": true}
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="perms"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages folder RWX permissions and home-directory hardening presets."
+PC_SCRIPT_USAGE="pc-perms.sh --action <set|remove|preset|list|apply> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         set, remove, preset, list, apply
+      --path <dir_or_file>    Target filesystem path for set/remove
+      --perms <RWX>           3-char permission string (e.g., RWX, R-X, R--, ---)
+      --recursive             Apply custom RWX rule recursively (default for directories)
+      --name <preset_name>    lock_dotfiles | restrict_extra_home_dirs | noexec_user_dirs
+      --enabled <true|false>  Enable or disable the specified preset"
+
+PERMS_ACTION=""
+TARGET_PATH=""
+RAW_PERMS=""
+RECURSIVE=1
+PRESET_NAME=""
+PRESET_ENABLED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_perms_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                PERMS_ACTION="${2:-}"
+                shift 2
+                ;;
+            --path)
+                TARGET_PATH="${2:-}"
+                shift 2
+                ;;
+            --perms)
+                RAW_PERMS="${2:-}"
+                shift 2
+                ;;
+            --recursive)
+                RECURSIVE=1
+                shift
+                ;;
+            --no-recursive)
+                RECURSIVE=0
+                shift
+                ;;
+            --name)
+                PRESET_NAME="${2:-}"
+                shift 2
+                ;;
+            --enabled)
+                PRESET_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-perms.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$PERMS_ACTION" ]]; then
+        pc_emit_error "Missing required --action <set|remove|preset|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$PERMS_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Ensure setfacl & Restricted User Are Ready
+# ------------------------------------------------------------------------------
+ensure_acl_tool() {
+    if ! command -v setfacl >/dev/null 2>&1; then
+        pc_log "INFO" "setfacl not found; installing 'acl' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
+    fi
+}
+
+get_restricted_user() {
+    pc_ensure_config_exists
+    local r_user
+    r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]]; then
+        pc_emit_error "No restricted_user configured in config.json. Run pc-setup.sh first." 2
+        exit 2
+    fi
+    if ! id -u "$r_user" >/dev/null 2>&1; then
+        pc_emit_error "Configured restricted_user '${r_user}' does not exist on this system." 1
+        exit 1
+    fi
+    printf '%s' "$r_user"
+}
+
+# ------------------------------------------------------------------------------
+# Validate Target Path & Normalize RWX String
+# ------------------------------------------------------------------------------
+validate_and_resolve_path() {
+    local input_path="$1"
+    if [[ -z "$input_path" ]]; then
+        pc_emit_error "Target --path cannot be empty." 2
+        exit 2
+    fi
+
+    if [[ ! -e "$input_path" ]]; then
+        pc_emit_error "Target path does not exist: '${input_path}'" 2
+        exit 2
+    fi
+
+    local resolved
+    resolved="$(realpath -e "$input_path")"
+
+    # Guard critical OS system roots from accidental permission lockouts
+    case "$resolved" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/libx32|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            pc_emit_error "Refusing to modify permissions on critical system directory: '${resolved}'" 2
+            exit 2
+            ;;
+        /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*|/var/*)
+            pc_emit_error "Refusing to modify permissions inside protected OS path: '${resolved}'" 2
+            exit 2
+            ;;
+    esac
+
+    printf '%s' "$resolved"
+}
+
+normalize_rwx_string() {
+    local input_perms="$1"
+    python3 -c '
+import sys
+raw = sys.argv[1].strip().upper()
+if len(raw) != 3:
+    sys.exit(1)
+if raw[0] not in ("R", "-") or raw[1] not in ("W", "-") or raw[2] not in ("X", "-"):
+    sys.exit(1)
+print(raw)
+' "$input_perms"
+}
+
+# ------------------------------------------------------------------------------
+# Low-Level POSIX ACL Application Helpers
+# ------------------------------------------------------------------------------
+apply_single_rwx_rule() {
+    local r_user="$1"
+    local target_path="$2"
+    local rwx_upper="$3"
+    local is_recursive="$4"
+
+    [[ -e "$target_path" ]] || return 0
+
+    local acl_perms
+    acl_perms="$(printf '%s' "$rwx_upper" | tr '[:upper:]' '[:lower:]')"
+
+    local rec_flag=()
+    if [[ "$is_recursive" -eq 1 && -d "$target_path" ]]; then
+        rec_flag=(-R)
+    fi
+
+    setfacl "${rec_flag[@]}" -m "u:${r_user}:${acl_perms}" "$target_path"
+
+    if [[ -d "$target_path" ]]; then
+        # Ensure newly created files/dirs inside this directory inherit the rule
+        setfacl "${rec_flag[@]}" -d -m "u:${r_user}:${acl_perms}" "$target_path" 2>/dev/null || true
+    fi
+}
+
+clear_single_rwx_rule() {
+    local r_user="$1"
+    local target_path="$2"
+
+    [[ -e "$target_path" ]] || return 0
+
+    if [[ -d "$target_path" ]]; then
+        setfacl -R -x "u:${r_user}" "$target_path" 2>/dev/null || true
+        setfacl -R -d -x "u:${r_user}" "$target_path" 2>/dev/null || true
+    else
+        setfacl -x "u:${r_user}" "$target_path" 2>/dev/null || true
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Home Directory Security Presets
+# ------------------------------------------------------------------------------
+apply_preset_state() {
+    local r_user="$1"
+    local preset="$2"
+    local enabled="$3"
+    local user_home
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+        pc_emit_error "Home directory not found for user '${r_user}'." 1
+        exit 1
+    fi
+
+    local r_group
+    r_group="$(id -gn "$r_user")"
+
+    case "$preset" in
+        lock_dotfiles)
+            local critical_files=(".bashrc" ".profile" ".bash_profile" ".zshrc" ".xinitrc" ".xsessionrc")
+            local critical_dirs=(".config/autostart" ".local/share/applications")
+
+            for f in "${critical_files[@]}"; do
+                local fp="${user_home}/${f}"
+                if [[ "$enabled" == "true" ]]; then
+                    [[ ! -e "$fp" ]] && touch "$fp"
+                    chown root:root "$fp"
+                    chmod 0644 "$fp"
+                elif [[ -e "$fp" ]]; then
+                    chown "${r_user}:${r_group}" "$fp"
+                    chmod 0644 "$fp"
+                fi
+            done
+
+            for d in "${critical_dirs[@]}"; do
+                local dp="${user_home}/${d}"
+                if [[ "$enabled" == "true" ]]; then
+                    mkdir -p "$dp"
+                    chown -R root:root "$dp"
+                    chmod -R go-w "$dp"
+                    chmod 0755 "$dp"
+                elif [[ -d "$dp" ]]; then
+                    chown -R "${r_user}:${r_group}" "$dp"
+                    chmod 0755 "$dp"
+                fi
+            done
+            ;;
+
+        restrict_extra_home_dirs)
+            shopt -s nullglob
+            for entry in "${user_home}"/*; do
+                local base_name
+                base_name="$(basename "$entry")"
+                local is_standard=0
+                for std_dir in "${PC_STANDARD_HOME_DIRS[@]}"; do
+                    if [[ "$base_name" == "$std_dir" ]]; then
+                        is_standard=1
+                        break
+                    fi
+                done
+                if [[ "$is_standard" -eq 0 ]]; then
+                    if [[ "$enabled" == "true" ]]; then
+                        setfacl -R -m "u:${r_user}:---" "$entry"
+                        [[ -d "$entry" ]] && setfacl -R -d -m "u:${r_user}:---" "$entry" 2>/dev/null || true
+                    else
+                        clear_single_rwx_rule "$r_user" "$entry"
+                    fi
+                fi
+            done
+            shopt -u nullglob
+            ;;
+
+        noexec_user_dirs)
+            local target_dirs=("Downloads" "Desktop" "Documents" "Public" "Templates")
+            for sub in "${target_dirs[@]}"; do
+                local dp="${user_home}/${sub}"
+                [[ -d "$dp" ]] || continue
+                if [[ "$enabled" == "true" ]]; then
+                    # rwX grants execute ONLY on directories (for traversal), never on regular files
+                    setfacl -R -m "u:${r_user}:rwX" "$dp"
+                    setfacl -R -d -m "u:${r_user}:rw-" "$dp" 2>/dev/null || true
+                    find "$dp" -type f -exec setfacl -m "u:${r_user}:rw-" {} + 2>/dev/null || true
+                else
+                    clear_single_rwx_rule "$r_user" "$dp"
+                fi
+            done
+            ;;
+
+        *)
+            pc_emit_error "Unknown preset '${preset}' (expected: lock_dotfiles, restrict_extra_home_dirs, noexec_user_dirs)." 2
+            exit 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Permissions State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_perms_state_json() {
+    pc_ensure_config_exists
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+perms = cfg.get("permissions", {})
+print(json.dumps({
+    "restricted_user": cfg.get("restricted_user", ""),
+    "presets": {
+        "lock_dotfiles": bool(perms.get("lock_dotfiles", False)),
+        "restrict_extra_home_dirs": bool(perms.get("restrict_extra_home_dirs", False)),
+        "noexec_user_dirs": bool(perms.get("noexec_user_dirs", False))
+    },
+    "custom_rules": perms.get("custom_rules", [])
+}))
+' "$PC_CONFIG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_set() {
+    local r_user resolved_path norm_perms
+    r_user="$(get_restricted_user)"
+    resolved_path="$(validate_and_resolve_path "$TARGET_PATH")"
+
+    if [[ -z "$RAW_PERMS" ]]; then
+        pc_emit_error "Action 'set' requires --perms <RWX|R-X|R--|--->." 2
+        exit 2
+    fi
+
+    if ! norm_perms="$(normalize_rwx_string "$RAW_PERMS")"; then
+        pc_emit_error "Invalid --perms '${RAW_PERMS}'. Must be 3 characters using R/W/X/- (e.g., RWX, R-X, R--, ---)." 2
+        exit 2
+    fi
+
+    ensure_acl_tool
+    pc_init_transaction
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    apply_single_rwx_rule "$r_user" "$resolved_path" "$norm_perms" "$RECURSIVE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, target_path, perms_str, rec_flag, out_path = sys.argv[1:6]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+perms = data.setdefault("permissions", {})
+rules = [r for r in perms.get("custom_rules", []) if r.get("path") != target_path]
+rules.append({
+    "path": target_path,
+    "perms": perms_str,
+    "recursive": rec_flag == "1"
+})
+rules.sort(key=lambda r: r.get("path", ""))
+perms["custom_rules"] = rules
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$resolved_path" "$norm_perms" "$RECURSIVE" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Applied [${norm_perms}] permissions on '${resolved_path}' for '${r_user}'" "$state_json"
+}
+
+handle_remove() {
+    if [[ -z "$TARGET_PATH" ]]; then
+        pc_emit_error "Action 'remove' requires --path <target_path>." 2
+        exit 2
+    fi
+
+    local r_user resolved_path
+    r_user="$(get_restricted_user)"
+    if [[ -e "$TARGET_PATH" ]]; then
+        resolved_path="$(realpath -e "$TARGET_PATH")"
+    else
+        resolved_path="$TARGET_PATH"
+    fi
+
+    ensure_acl_tool
+    pc_init_transaction
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    clear_single_rwx_rule "$r_user" "$resolved_path"
+
+    local tmp_cfg removed_count
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_count="$(python3 -c '
+import json, sys
+
+cfg_path, target_path, out_path = sys.argv[1:4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+perms = data.setdefault("permissions", {})
+old_rules = perms.get("custom_rules", [])
+new_rules = [r for r in old_rules if r.get("path") != target_path]
+perms["custom_rules"] = new_rules
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(len(old_rules) - len(new_rules))
+' "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No saved permission rule found for '${resolved_path}'." 2
+        exit 2
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Removed custom permission rule for '${resolved_path}'" "$state_json"
+}
+
+handle_preset() {
+    if [[ -z "$PRESET_NAME" ]]; then
+        pc_emit_error "Action 'preset' requires --name <lock_dotfiles|restrict_extra_home_dirs|noexec_user_dirs>." 2
+        exit 2
+    fi
+
+    if [[ "$PRESET_ENABLED" != "true" && "$PRESET_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'preset' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    local r_user
+    r_user="$(get_restricted_user)"
+    ensure_acl_tool
+
+    pc_init_transaction
+    apply_preset_state "$r_user" "$PRESET_NAME" "$PRESET_ENABLED"
+    pc_json_set "permissions.${PRESET_NAME}" "$PRESET_ENABLED"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Set permission preset '${PRESET_NAME}' to ${PRESET_ENABLED}" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Retrieved directory permission rules and presets" "$state_json"
+}
+
+handle_apply() {
+    local r_user
+    r_user="$(get_restricted_user)"
+    ensure_acl_tool
+
+    pc_init_transaction
+
+    for preset in lock_dotfiles restrict_extra_home_dirs noexec_user_dirs; do
+        local is_on
+        is_on="$(pc_json_get "permissions.${preset}" 2>/dev/null || printf 'false')"
+        apply_preset_state "$r_user" "$preset" "$is_on"
+    done
+
+    local rules_lines
+    rules_lines="$(python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for r in cfg.get("permissions", {}).get("custom_rules", []):
+    rec = "1" if r.get("recursive", True) else "0"
+    print(f"{r.get(\"path\", \"\")}|{r.get(\"perms\", \"R-X\")}|{rec}")
+' "$PC_CONFIG_FILE")"
+
+    while IFS='|' read -r r_path r_perms r_rec; do
+        [[ -z "$r_path" ]] && continue
+        apply_single_rwx_rule "$r_user" "$r_path" "$r_perms" "$r_rec"
+    done <<< "$rules_lines"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Applied all directory permissions and presets for '${r_user}'" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_perms_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$PERMS_ACTION" in
+        set)
+            handle_set
+            ;;
+        remove)
+            handle_remove
+            ;;
+        preset)
+            handle_preset
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${PERMS_ACTION}' (expected: set, remove, preset, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_PERMS_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-perms.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-perms.sh
+}
+
+# ------------------------------------------------------------------------------
 # Deploy Initial Master Configuration (/etc/parentcontrol/config.json)
 # ------------------------------------------------------------------------------
 deploy_initial_config() {
@@ -1395,6 +2682,9 @@ deploy_initial_config() {
 # ------------------------------------------------------------------------------
 # Automated Verification Self-Test
 # ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Automated Verification Self-Test
+# ------------------------------------------------------------------------------
 run_self_test() {
     log_step "Running automated verification self-test..."
 
@@ -1402,16 +2692,11 @@ run_self_test() {
     [[ "$VERBOSE" -eq 1 ]] && test_flags+=(--verbose)
     [[ "$FORCE_OS" -eq 1 ]] && test_flags+=(--force-os)
 
-    bash -c '
-        source /opt/parentcontrol/lib/common.sh
-        PC_MODULE_NAME="selftest"
-        PC_CURRENT_ACTION="verify"
-        pc_parse_common_flags "$@"
-        pc_require_root
-        pc_verify_mint
-        pc_ensure_config_exists
-        pc_emit_result "Sub-Chunk 1.1 library verified successfully" "{\"mint_verified\":true}"
-    ' _ "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh status --action check "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh config --action get --key browser "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh logs --action read --lines 5 "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh acl --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh perms --action list "${test_flags[@]}"
 }
 
 # ------------------------------------------------------------------------------
@@ -1425,12 +2710,14 @@ main() {
     deploy_common_sh
     deploy_pc_ctl_sh
     deploy_pc_setup_sh
+    deploy_pc_net_acl_sh
+    deploy_pc_perms_sh
     deploy_initial_config
 
     if [[ "$SKIP_TEST" -eq 0 ]]; then
         run_self_test
     else
-        printf '[OK] ParentControl Sub-Chunk 1.3 deployed (self-test skipped).\n'
+        printf '[OK] ParentControl Part 3 deployed (self-test skipped).\n'
     fi
 }
 
