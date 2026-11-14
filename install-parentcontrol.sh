@@ -1550,8 +1550,21 @@ with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
 net = cfg.get("network", {})
-whitelist = {x.lower() for x in net.get("whitelist", [])}
-greylist = {x.lower() for x in net.get("greylist", [])}
+def expand_variants(items):
+    out = set()
+    for x in items:
+        d = x.lower().strip(".")
+        if not d:
+            continue
+        out.add(d)
+        if d.startswith("www."):
+            out.add(d[4:])
+        else:
+            out.add("www." + d)
+    return out
+
+whitelist = expand_variants(net.get("whitelist", []))
+greylist = expand_variants(net.get("greylist", []))
 allowed = whitelist | greylist
 blacklist = [x.lower() for x in net.get("blacklist", [])]
 sources = net.get("feed_sources", {})
@@ -1603,6 +1616,7 @@ PYEOF
     chown root:root "$tmp_hosts"
     chmod 0644 "$tmp_hosts"
     mv "$tmp_hosts" "$PC_HOSTS_FILE"
+    resolvectl flush-caches >/dev/null 2>&1 || true
 }
 
 build_acl_state_json() {
@@ -3920,25 +3934,8 @@ deploy_pc_queue_sh() {
     cat << 'PC_QUEUE_SH_EOF' > /opt/parentcontrol/bin/pc-queue.sh
 #!/usr/bin/env bash
 # ==============================================================================
-# ParentControl - Approvals Queue & User Request Manager
+# ParentControl - Unprivileged Request Dropbox & Admin Approvals Queue
 # File: /opt/parentcontrol/bin/pc-queue.sh
-#
-# Description:
-#   Manages restricted-user access requests (app unlocks, URL whitelists, file
-#   downloads). Unprivileged users can submit requests to the sticky-bit spool
-#   directory (/var/spool/parentcontrol/requests); root/admin actions ingest,
-#   approve (auto-applying the rule), deny, or remove items.
-#
-# GUI HANDOFF:
-#   Invoked via pc-ctl.sh:
-#     pkexec /opt/parentcontrol/bin/pc-ctl.sh queue --action <verb> [OPTIONS] --json
-#
-#   Supported Actions:
-#     request --type <app|web|file|other> --target <value> [--user <name>] [--reason <text>] --json
-#     approve --id <req_id> | --target <value> --json
-#     deny    --id <req_id> | --target <value> --json
-#     remove  --id <req_id> | --target <value> --json
-#     list    --json
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -3948,77 +3945,50 @@ source "/opt/parentcontrol/lib/common.sh"
 
 PC_MODULE_NAME="queue"
 PC_CURRENT_ACTION="list"
-PC_SCRIPT_DESC="Manages the ParentControl approvals queue for app, web, and download requests."
-PC_SCRIPT_USAGE="pc-queue.sh --action <request|approve|deny|remove|list> [OPTIONS]"
-PC_SCRIPT_FLAGS="      --action <verb>         request, approve, deny, remove, list
-      --id <req_id>           Request ID (e.g., req-20261114-123456)
-      --user <username>       Requesting user (defaults to current user)
-      --type <category>       app | web | file | other
-      --target <value>        Application name, URL/domain, or filename
-      --reason <text>         Optional note from the user"
+PC_SCRIPT_DESC="Manages unprivileged user access requests and administrator approve/deny decisions."
+PC_SCRIPT_USAGE="pc-queue.sh --action <request|list|approve|deny|remove> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>      request, list, approve, deny, remove
+      --id <req_id>        Request ID (e.g., req-20261114...)
+      --type <category>    web | app | file | other (for --action request)
+      --target <value>     Domain, application name, folder path, or topic
+      --reason <text>      Optional explanation from the user
+      --user <username>    Requesting username (auto-detected if omitted)"
 
-readonly PC_SPOOL_DIR="/var/spool/parentcontrol/requests"
-readonly PC_QUEUE_FILE="${PC_VAR_DIR}/queue.json"
+PC_QUEUE_FILE="${PC_QUEUE_FILE:-/var/lib/parentcontrol/queue.json}"
+PC_SPOOL_DIR="${PC_SPOOL_DIR:-/var/spool/parentcontrol/requests}"
 
 QUEUE_ACTION=""
 REQ_ID=""
-REQ_USER=""
-REQ_TYPE="app"
+REQ_TYPE="other"
 REQ_TARGET=""
 REQ_REASON=""
+REQ_USER=""
 
-# ------------------------------------------------------------------------------
-# Parse Module-Specific Flags
-# ------------------------------------------------------------------------------
 parse_queue_args() {
     pc_parse_common_flags "$@"
     set -- "${PC_REMAINING_ARGS[@]}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --action)
-                QUEUE_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
-                shift 2
-                ;;
-            --id)
-                REQ_ID="${2:-}"
-                shift 2
-                ;;
-            --user)
-                REQ_USER="${2:-}"
-                shift 2
-                ;;
-            --type)
-                REQ_TYPE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
-                shift 2
-                ;;
-            --target)
-                REQ_TARGET="${2:-}"
-                shift 2
-                ;;
-            --reason)
-                REQ_REASON="${2:-}"
-                shift 2
-                ;;
-            *)
-                pc_emit_error "Unknown flag for pc-queue.sh: $1" 2
-                exit 2
-                ;;
+            --action) QUEUE_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+            --id)     REQ_ID="${2:-}"; shift 2 ;;
+            --type)   REQ_TYPE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+            --target) REQ_TARGET="${2:-}"; shift 2 ;;
+            --reason) REQ_REASON="${2:-}"; shift 2 ;;
+            --user)   REQ_USER="${2:-}"; shift 2 ;;
+            *) pc_emit_error "Unknown flag for pc-queue.sh: $1" 2; exit 2 ;;
         esac
     done
 
     if [[ -z "$QUEUE_ACTION" ]]; then
-        pc_emit_error "Missing required --action <request|approve|deny|remove|list>." 2
+        pc_emit_error "Missing required --action flag." 2
         exit 2
     fi
     PC_CURRENT_ACTION="$QUEUE_ACTION"
 }
 
-# ------------------------------------------------------------------------------
-# Ensure Queue Store & Ingest Any New Spool Requests
-# ------------------------------------------------------------------------------
 ensure_queue_file() {
-    mkdir -p "$PC_VAR_DIR"
+    mkdir -p "$(dirname "$PC_QUEUE_FILE")"
     if [[ ! -f "$PC_QUEUE_FILE" ]]; then
         printf '{"requests": []}\n' > "$PC_QUEUE_FILE"
         chown root:root "$PC_QUEUE_FILE"
@@ -4028,139 +3998,143 @@ ensure_queue_file() {
 
 ingest_spool_requests() {
     ensure_queue_file
-    [[ -d "$PC_SPOOL_DIR" ]] || return 0
+    mkdir -p "$PC_SPOOL_DIR"
 
-    python3 -c '
+    python3 - "$PC_SPOOL_DIR" "$PC_QUEUE_FILE" << 'PYEOF'
 import glob, json, os, sys
 
 spool_dir, queue_path = sys.argv[1:3]
+spool_files = sorted(glob.glob(os.path.join(spool_dir, "req-*.json")))
+if not spool_files:
+    sys.exit(0)
+
 with open(queue_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
+    qdata = json.load(f)
 
-requests = data.setdefault("requests", [])
-existing_ids = {r.get("id") for r in requests}
+reqs = qdata.setdefault("requests", [])
+existing_ids = {r.get("id") for r in reqs}
 
-ingested = 0
-for fp in sorted(glob.glob(os.path.join(spool_dir, "req-*.json"))):
+for sf in spool_files:
     try:
-        with open(fp, "r", encoding="utf-8") as rf:
+        with open(sf, "r", encoding="utf-8") as rf:
             item = json.load(rf)
-        if isinstance(item, dict) and item.get("id") and item.get("target"):
-            if item["id"] not in existing_ids:
-                requests.append({
-                    "id": str(item["id"]),
-                    "user": str(item.get("user", "unknown")),
-                    "type": str(item.get("type", "Other")),
-                    "target": str(item["target"]),
-                    "reason": str(item.get("reason", "")),
-                    "status": "Pending",
-                    "created_at": str(item.get("created_at", ""))
-                })
-                existing_ids.add(item["id"])
-                ingested += 1
-        os.remove(fp)
+        if isinstance(item, dict) and item.get("id") and item["id"] not in existing_ids:
+            reqs.append(item)
+            existing_ids.add(item["id"])
+        os.remove(sf)
     except Exception:
-        # Remove malformed spool files so they do not stall ingestion
         try:
-            os.remove(fp)
+            os.remove(sf)
         except Exception:
             pass
 
-if ingested > 0:
-    tmp_path = queue_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as wf:
-        json.dump(data, wf, indent=2)
-        wf.write("\n")
-    os.chmod(tmp_path, 0o640)
-    os.replace(tmp_path, queue_path)
-' "$PC_SPOOL_DIR" "$PC_QUEUE_FILE"
+tmp_path = queue_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as wf:
+    json.dump(qdata, wf, indent=2)
+    wf.write("\n")
+os.chmod(tmp_path, 0o640)
+os.replace(tmp_path, queue_path)
+PYEOF
 }
 
 build_queue_state_json() {
-    ingest_spool_requests
-    python3 -c '
+    ensure_queue_file
+    python3 - "$PC_QUEUE_FILE" << 'PYEOF'
 import json, sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
+    qdata = json.load(f)
 
-reqs = data.get("requests", [])
-pending_count = sum(1 for r in reqs if str(r.get("status", "")).lower() == "pending")
+reqs = qdata.get("requests", [])
+pending = sum(1 for r in reqs if str(r.get("status", "")).lower() == "pending")
 print(json.dumps({
     "count": len(reqs),
-    "pending_count": pending_count,
+    "pending_count": pending,
     "requests": reqs
 }))
-' "$PC_QUEUE_FILE"
+PYEOF
 }
 
-# ------------------------------------------------------------------------------
-# Unprivileged Action: Submit a New Request to Spool Dropbox
-# ------------------------------------------------------------------------------
 handle_request() {
     if [[ -z "$REQ_TARGET" ]]; then
-        pc_emit_error "Action 'request' requires --target <app|url|file>." 2
+        pc_emit_error "Missing --target <domain|app|file|topic> for request." 2
         exit 2
     fi
 
-    if [[ ! -d "$PC_SPOOL_DIR" ]]; then
-        pc_emit_error "Request spool directory does not exist: ${PC_SPOOL_DIR}" 1
-        exit 1
-    fi
-
-    local submitter="$REQ_USER"
-    if [[ -z "$submitter" ]]; then
-        submitter="$(id -un)"
-    fi
-
-    local display_type
+    local submitter="${REQ_USER:-${SUDO_USER:-${USER:-unknown}}}"
+    local type_label="Other"
     case "$REQ_TYPE" in
-        app|application) display_type="App Access" ;;
-        web|url|site|domain) display_type="Web Access" ;;
-        file|download) display_type="Download File" ;;
-        *) display_type="Other" ;;
+        web|website|url)       type_label="Web Access" ;;
+        app|application)       type_label="Application Unlock" ;;
+        file|folder|download)  type_label="File Download" ;;
+        other|help|message)    type_label="Other" ;;
+        *)                     type_label="$REQ_TYPE" ;;
     esac
 
-    local created_json
-    created_json="$(python3 -c '
-import datetime, json, os, random, sys
+    local ts req_id spool_file
+    ts="$(date -u +%Y%m%d%H%M%S)"
+    req_id="req-${ts}-$$-${RANDOM}"
+    mkdir -p "$PC_SPOOL_DIR" 2>/dev/null || true
+    spool_file="${PC_SPOOL_DIR}/${req_id}.json"
 
-spool_dir, user, req_type, target, reason = sys.argv[1:6]
-now = datetime.datetime.now(datetime.timezone.utc)
-ts = now.strftime("%Y%m%d%H%M%S")
-req_id = f"req-{ts}-{random.randint(1000, 9999)}"
-payload = {
-    "id": req_id,
+    local req_json
+    req_json="$(python3 - "$req_id" "$submitter" "$type_label" "$REQ_TARGET" "$REQ_REASON" "$spool_file" << 'PYEOF'
+import datetime, json, os, sys
+
+rid, user, rtype, target, reason, out_file = sys.argv[1:7]
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+obj = {
+    "id": rid,
     "user": user,
-    "type": req_type,
+    "type": rtype,
     "target": target.strip(),
     "reason": reason.strip(),
     "status": "Pending",
-    "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    "created_at": now
 }
-out_file = os.path.join(spool_dir, f"{req_id}.json")
-with open(out_file, "w", encoding="utf-8") as f:
-    json.dump(payload, f, indent=2)
-    f.write("\n")
-os.chmod(out_file, 0o644)
-print(json.dumps(payload))
-' "$PC_SPOOL_DIR" "$submitter" "$display_type" "$REQ_TARGET" "$REQ_REASON")"
+with open(out_file, "w", encoding="utf-8") as wf:
+    json.dump(obj, wf, indent=2)
+    wf.write("\n")
+try:
+    os.chmod(out_file, 0o664)
+except Exception:
+    pass
+print(json.dumps(obj))
+PYEOF
+)"
 
-    if [[ "${PC_JSON_OUTPUT:-${PC_OUTPUT_JSON:-0}}" -eq 1 ]]; then
-        printf '{"status": "ok", "module": "queue", "action": "request", "message": "Submitted approval request", "data": %s}\n' "$created_json"
+    if [[ "${PC_JSON_OUTPUT:-0}" -eq 1 ]]; then
+        printf '{"status": "ok", "module": "queue", "action": "request", "message": "Submitted approval request", "data": %s}\n' "$req_json"
     else
-        printf '[OK] Submitted approval request for %s (%s)\n' "$REQ_TARGET" "$display_type"
+        printf '[OK] Submitted approval request (%s) for %s\n' "$req_id" "$REQ_TARGET"
     fi
 }
 
-# ------------------------------------------------------------------------------
-# Privileged Actions: Approve, Deny, Remove, List
-# ------------------------------------------------------------------------------
-update_request_decision() {
-    local new_status="$1" # "Approved" or "Denied"
+apply_approved_action() {
+    local req_type="$1"
+    local req_target="$2"
+    local lower_type out=""
+    lower_type="$(printf '%s' "$req_type" | tr '[:upper:]' '[:lower:]')"
 
+    if [[ "$lower_type" == *"web"* || "$lower_type" == *"url"* ]]; then
+        if ! out="$("${PC_BIN_DIR}/pc-net-acl.sh" --action add --list whitelist --target "$req_target" --json 2>&1)"; then
+            pc_log "WARN" "Approval hook (acl) failed for '${req_target}': ${out}"
+        fi
+    elif [[ "$lower_type" == *"app"* ]]; then
+        if ! out="$("${PC_BIN_DIR}/pc-apps.sh" --action set --app "$req_target" --status Allow --json 2>&1)"; then
+            pc_log "WARN" "Approval hook (apps) failed for '${req_target}': ${out}"
+        fi
+    elif [[ "$lower_type" == *"file"* || "$lower_type" == *"folder"* ]]; then
+        if ! out="$("${PC_BIN_DIR}/pc-perms.sh" --action set --path "$req_target" --mode full --json 2>&1)"; then
+            pc_log "WARN" "Approval hook (perms) failed for '${req_target}': ${out}"
+        fi
+    fi
+}
+
+handle_decision() {
+    local new_status="$1" # "Approved" or "Denied"
     if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
-        pc_emit_error "Action requires --id <req_id> or --target <target>." 2
+        pc_emit_error "Specify --id <req_id> or --target <value>." 2
         exit 2
     fi
 
@@ -4169,68 +4143,71 @@ update_request_decision() {
     pc_backup_file "$PC_QUEUE_FILE"
 
     local match_info
-    match_info="$(python3 -c '
-import json, os, sys
+    match_info="$(python3 - "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" "$new_status" << 'PYEOF'
+import datetime, json, os, sys
 
-queue_path, req_id, req_target, new_status = sys.argv[1:5]
-with open(queue_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
+q_path, req_id, req_target, decision = sys.argv[1:5]
+with open(q_path, "r", encoding="utf-8") as f:
+    qdata = json.load(f)
 
-reqs = data.get("requests", [])
+reqs = qdata.get("requests", [])
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 matched = None
-for r in reversed(reqs):
-    if req_id and r.get("id") == req_id:
-        r["status"] = new_status
+
+# Prefer matching Pending items first
+for r in reqs:
+    if str(r.get("status", "")).lower() != "pending":
+        continue
+    if (req_id and r.get("id") == req_id) or (req_target and r.get("target", "").lower() == req_target.lower()):
         matched = r
         break
-    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
-        if str(r.get("status", "")).lower() == "pending":
-            r["status"] = new_status
+
+# Fallback if explicit --id was provided
+if matched is None and req_id:
+    for r in reqs:
+        if r.get("id") == req_id:
             matched = r
             break
 
-if not matched:
-    sys.exit(1)
+if matched is None:
+    print("0||")
+    sys.exit(0)
 
-tmp_path = queue_path + ".tmp"
+matched["status"] = decision
+matched["decided_at"] = now
+
+tmp_path = q_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as wf:
-    json.dump(data, wf, indent=2)
+    json.dump(qdata, wf, indent=2)
     wf.write("\n")
 os.chmod(tmp_path, 0o640)
-os.replace(tmp_path, queue_path)
+os.replace(tmp_path, q_path)
 
-print(json.dumps(matched))
-' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" "$new_status" 2>/dev/null || true)"
+print(f"1|{matched.get('type', '')}|{matched.get('target', '')}")
+PYEOF
+)"
 
-    if [[ -z "$match_info" ]]; then
+    local found matched_type matched_target
+    IFS='|' read -r found matched_type matched_target <<< "$match_info"
+
+    if [[ "$found" != "1" ]]; then
         pc_commit_transaction
         pc_emit_error "No matching pending request found in approvals queue." 2
         exit 2
     fi
 
-    # Automatically enforce rule if Approved
-    if [[ "$new_status" == "Approved" ]]; then
-        local m_type m_target
-        m_type="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("type", ""))' "$match_info")"
-        m_target="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("target", ""))' "$match_info")"
-
-        if [[ "$m_type" == "App Access" && -x "${PC_BIN_DIR}/pc-apps.sh" ]]; then
-            "${PC_BIN_DIR}/pc-apps.sh" --action allow --app "$m_target" --json >/dev/null 2>&1 || true
-        elif [[ "$m_type" == "Web Access" && -x "${PC_BIN_DIR}/pc-net-acl.sh" ]]; then
-            "${PC_BIN_DIR}/pc-net-acl.sh" --action add --list whitelist --target "$m_target" --json >/dev/null 2>&1 || true
-        fi
-    fi
-
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_queue_state_json)"
-    pc_emit_result "Marked request as ${new_status}" "$state_json"
+    if [[ "$new_status" == "Approved" && -n "$matched_target" ]]; then
+        apply_approved_action "$matched_type" "$matched_target"
+    fi
+
+    pc_emit_result "Marked request as ${new_status}" "$(build_queue_state_json)"
 }
 
 handle_remove() {
     if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
-        pc_emit_error "Action 'remove' requires --id <req_id> or --target <target>." 2
+        pc_emit_error "Specify --id <req_id> or --target <value> to remove." 2
         exit 2
     fi
 
@@ -4239,58 +4216,37 @@ handle_remove() {
     pc_backup_file "$PC_QUEUE_FILE"
 
     local removed_count
-    removed_count="$(python3 -c '
+    removed_count="$(python3 - "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" << 'PYEOF'
 import json, os, sys
 
-queue_path, req_id, req_target = sys.argv[1:4]
-with open(queue_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
+q_path, req_id, req_target = sys.argv[1:4]
+with open(q_path, "r", encoding="utf-8") as f:
+    qdata = json.load(f)
 
-old_reqs = data.get("requests", [])
-kept = []
-removed = 0
-for r in old_reqs:
+old = qdata.get("requests", [])
+new = []
+for r in old:
     if req_id and r.get("id") == req_id:
-        removed += 1
         continue
-    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
-        removed += 1
+    if not req_id and req_target and r.get("target", "").lower() == req_target.lower():
         continue
-    kept.append(r)
+    new.append(r)
 
-data["requests"] = kept
-tmp_path = queue_path + ".tmp"
+qdata["requests"] = new
+tmp_path = q_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as wf:
-    json.dump(data, wf, indent=2)
+    json.dump(qdata, wf, indent=2)
     wf.write("\n")
 os.chmod(tmp_path, 0o640)
-os.replace(tmp_path, queue_path)
-
-print(removed)
-' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET")"
-
-    if [[ "$removed_count" -eq 0 ]]; then
-        pc_commit_transaction
-        pc_emit_error "No matching queue entry found to remove." 2
-        exit 2
-    fi
+os.replace(tmp_path, q_path)
+print(len(old) - len(new))
+PYEOF
+)"
 
     pc_commit_transaction
-
-    local state_json
-    state_json="$(build_queue_state_json)"
-    pc_emit_result "Removed ${removed_count} item(s) from approvals queue" "$state_json"
+    pc_emit_result "Removed ${removed_count} item(s) from approvals queue" "$(build_queue_state_json)"
 }
 
-handle_list() {
-    local state_json
-    state_json="$(build_queue_state_json)"
-    pc_emit_result "Retrieved approvals queue" "$state_json"
-}
-
-# ------------------------------------------------------------------------------
-# Main Execution
-# ------------------------------------------------------------------------------
 main() {
     parse_queue_args "$@"
 
@@ -4303,20 +4259,21 @@ main() {
     pc_verify_mint
 
     case "$QUEUE_ACTION" in
+        list)
+            ingest_spool_requests
+            pc_emit_result "Retrieved approvals queue" "$(build_queue_state_json)"
+            ;;
         approve)
-            update_request_decision "Approved"
+            handle_decision "Approved"
             ;;
         deny)
-            update_request_decision "Denied"
+            handle_decision "Denied"
             ;;
         remove)
             handle_remove
             ;;
-        list)
-            handle_list
-            ;;
         *)
-            pc_emit_error "Unsupported action '${QUEUE_ACTION}' (expected: request, approve, deny, remove, list)." 2
+            pc_emit_error "Unsupported queue action '${QUEUE_ACTION}'." 2
             exit 2
             ;;
     esac
