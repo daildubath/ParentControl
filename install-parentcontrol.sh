@@ -86,6 +86,14 @@ parse_args() {
                 show_help
                 exit 0
                 ;;
+            --uninstall)
+                UNINSTALL_MODE=1
+                shift
+                ;;
+            --purge)
+                PURGE_MODE=1
+                shift
+                ;;
             *)
                 printf '[ERROR] Unknown option: %s\n\n' "$1" >&2
                 show_help >&2
@@ -93,7 +101,12 @@ parse_args() {
                 ;;
         esac
     done
+    if [[ "${UNINSTALL_MODE:-0}" -eq 1 ]]; then
+        run_uninstall
+        exit 0
+    fi
 }
+
 
 log_step() {
     local msg="$1"
@@ -4835,6 +4848,185 @@ PC_MAINT_SH_EOF
     chmod 0755 /opt/parentcontrol/bin/pc-maint.sh
 }
 
+deploy_boot_service() {
+    log_step "Installing and enabling /etc/systemd/system/parentcontrol-boot.service..."
+
+    cat << 'BOOT_UNIT_EOF' > /etc/systemd/system/parentcontrol-boot.service
+[Unit]
+Description=ParentControl Boot-Time Policy Enforcement
+Documentation=file:///opt/parentcontrol/bin/pc-ctl.sh
+After=local-fs.target network-online.target ufw.service
+Wants=network-online.target
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for mod in acl perms ports devices apps; do /opt/parentcontrol/bin/pc-ctl.sh "$mod" --action apply --json >/dev/null 2>&1 || true; done'
+
+[Install]
+WantedBy=multi-user.target
+BOOT_UNIT_EOF
+
+    chown root:root /etc/systemd/system/parentcontrol-boot.service
+    chmod 0644 /etc/systemd/system/parentcontrol-boot.service
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable parentcontrol-boot.service >/dev/null 2>&1 || true
+    fi
+}
+
+run_uninstall() {
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        printf '[ERROR] --uninstall must be run as root (use sudo).\n' >&2
+        exit 1
+    fi
+
+    printf '[INFO] Starting ParentControl teardown...\n'
+
+    local cfg_file="/etc/parentcontrol/config.json"
+    local r_user=""
+    local admin_user="pcadmin"
+
+    if [[ -f "$cfg_file" ]] && command -v python3 >/dev/null 2>&1; then
+        r_user="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("restricted_user",""))' "$cfg_file" 2>/dev/null || true)"
+        admin_user="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("admin_user","pcadmin"))' "$cfg_file" 2>/dev/null || printf 'pcadmin')"
+    fi
+    if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
+        r_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $1 != "pcadmin" {print $1; exit}' /etc/passwd)"
+    fi
+
+    # 1. Stop & remove systemd boot service
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl disable --now parentcontrol-boot.service >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/parentcontrol-boot.service
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    # 2. Restore sudo/adm privileges to monitored user
+    if [[ -n "$r_user" ]] && id -u "$r_user" >/dev/null 2>&1; then
+        usermod -aG sudo,adm "$r_user" 2>/dev/null || true
+        printf '[OK] Restored sudo/adm group membership for %s\n' "$r_user"
+    fi
+
+    # 3. Revert folder ACLs, ownerships, and app/installer binary locks
+    if [[ -f "$cfg_file" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$cfg_file" "$r_user" << 'PYEOF' || true
+import json, os, subprocess, sys
+
+cfg_path, def_user = sys.argv[1:3]
+try:
+    cfg = json.load(open(cfg_path, "r", encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+
+# Restore custom folder rules
+for rule in cfg.get("permissions", {}).get("custom_rules", []):
+    p = rule.get("path", "")
+    owner = rule.get("orig_owner") or def_user
+    group = rule.get("orig_group") or def_user
+    if p and os.path.exists(p):
+        subprocess.run(["setfacl", "-R", "-b", p], stderr=subprocess.DEVNULL)
+        if owner and group:
+            subprocess.run(["chown", "-R", f"{owner}:{group}", p], stderr=subprocess.DEVNULL)
+
+# Clear app binary ACLs
+if def_user:
+    for rule in cfg.get("applications", {}).get("rules", []):
+        bp = rule.get("binary_path", "")
+        if bp and os.path.exists(bp):
+            subprocess.run(["setfacl", "-x", f"u:{def_user}", bp], stderr=subprocess.DEVNULL)
+
+# Remove ParentControl UFW rules
+for pr in cfg.get("ports", {}).get("blocked_ports", []):
+    port = str(pr.get("port", "")).strip()
+    proto = str(pr.get("protocol", "BOTH")).upper()
+    if not port.isdigit():
+        continue
+    protos = ["tcp", "udp"] if proto == "BOTH" else [proto.lower()]
+    for p_item in protos:
+        subprocess.run(["ufw", "--force", "delete", "deny", f"{port}/{p_item}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["ufw", "--force", "delete", "deny", port], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+PYEOF
+    fi
+
+    if [[ -n "$r_user" ]] && id -u "$r_user" >/dev/null 2>&1; then
+        local user_home r_group
+        user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+        r_group="$(id -gn "$r_user")"
+
+        for df in ".bashrc" ".profile" ".bash_aliases" ".zshrc"; do
+            [[ -f "${user_home}/${df}" ]] && chown "${r_user}:${r_group}" "${user_home}/${df}" 2>/dev/null || true
+        done
+        for hdir in /home/*; do
+            [[ -d "$hdir" ]] && setfacl -x "u:${r_user}" "$hdir" 2>/dev/null || true
+        done
+        for bin in /usr/bin/mintinstall /usr/bin/gnome-software /usr/bin/synaptic /usr/bin/gdebi-gtk /usr/bin/flatpak; do
+            [[ -e "$bin" ]] && setfacl -x "u:${r_user}" "$bin" 2>/dev/null || true
+        done
+        rm -f "${user_home}/.config/autostart/parentcontrol-accessibility.desktop"
+    fi
+
+    # 4. Strip ParentControl managed block from /etc/hosts & flush DNS
+    if [[ -f /etc/hosts ]]; then
+        python3 - << 'PYEOF' || true
+p = "/etc/hosts"
+out = []
+in_block = False
+with open(p, "r", encoding="utf-8", errors="replace") as f:
+    for line in f:
+        s = line.strip()
+        if s == "# BEGIN PARENTCONTROL MANAGED BLOCKS":
+            in_block = True
+            continue
+        if s == "# END PARENTCONTROL MANAGED BLOCKS":
+            in_block = False
+            continue
+        if not in_block:
+            out.append(line)
+with open(p, "w", encoding="utf-8") as wf:
+    wf.writelines(out)
+PYEOF
+        resolvectl flush-caches >/dev/null 2>&1 || true
+    fi
+
+    # 5. Remove hardware modprobe/udev locks and reload drivers
+    rm -f /etc/modprobe.d/parentcontrol-*.conf /etc/udev/rules.d/99-parentcontrol-*.rules
+    udevadm control --reload-rules >/dev/null 2>&1 || true
+    udevadm trigger >/dev/null 2>&1 || true
+    modprobe usb_storage >/dev/null 2>&1 || true
+    modprobe uvcvideo >/dev/null 2>&1 || true
+    modprobe btusb >/dev/null 2>&1 || true
+
+    # 6. Remove cron jobs, PolicyKit rules, launchers, CLI symlink, and /opt/parentcontrol
+    rm -f /etc/cron.d/parentcontrol-*
+    rm -f /etc/polkit-1/rules.d/49-parentcontrol.rules
+    rm -f /usr/share/polkit-1/actions/com.parentcontrol.gui.policy
+    rm -f /usr/share/applications/parentcontrol.desktop /usr/share/applications/parentcontrol-request.desktop
+    rm -f /usr/local/bin/pc-ctl
+    rm -rf /opt/parentcontrol
+
+    # 7. Remove pcadmin account
+    if [[ -n "$admin_user" && "$admin_user" != "root" && "$admin_user" != "$r_user" ]] && id -u "$admin_user" >/dev/null 2>&1; then
+        pkill -u "$admin_user" >/dev/null 2>&1 || true
+        userdel -r "$admin_user" >/dev/null 2>&1 || userdel "$admin_user" >/dev/null 2>&1 || true
+        printf '[OK] Removed administrator account: %s\n' "$admin_user"
+    fi
+
+    # 8. Optional --purge for config, state, spool, and logs
+    if [[ "${PURGE_MODE:-0}" -eq 1 ]]; then
+        rm -rf /etc/parentcontrol /var/lib/parentcontrol /var/log/parentcontrol /var/spool/parentcontrol
+        printf '[OK] Purged configuration, state, and log directories.\n'
+    else
+        printf '[INFO] Preserved /etc/parentcontrol and /var/log/parentcontrol (pass --purge to delete).\n'
+    fi
+
+    printf '[SUCCESS] ParentControl has been cleanly uninstalled.\n'
+}
+
 deploy_parentcontrol_admin_gui_py() {
     log_step "Writing /opt/parentcontrol/gui/parentcontrol-gui.py, PolicyKit GUI policy, and desktop launcher..."
 
@@ -6552,6 +6744,7 @@ main() {
     deploy_pc_maint_sh
     deploy_pc_request_popup_py
     deploy_parentcontrol_admin_gui_py
+    deploy_boot_service
     deploy_initial_config
     /opt/parentcontrol/bin/pc-setup.sh --action init --json >/dev/null 2>&1 || true
 
