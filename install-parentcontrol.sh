@@ -1068,7 +1068,9 @@ install_user_request_shortcut() {
 handle_init() {
     pc_ensure_config_exists
     ensure_pcadmin_account
-    deploy_polkit_rule
+    if passwd -S "$PC_ADMIN_USER" 2>/dev/null | awk '{print $2}' | grep -qx "P"; then
+        deploy_polkit_rule
+    fi
 
     local r_user
     r_user="$(detect_default_desktop_user)"
