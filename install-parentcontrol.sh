@@ -138,6 +138,14 @@ create_directories() {
     install -d -m 0750 -o root -g root /var/lib/parentcontrol/queue/approved
     install -d -m 0750 -o root -g root /var/lib/parentcontrol/queue/archive
 
+    mkdir -p /var/spool/parentcontrol
+    chown root:root /var/spool/parentcontrol
+    chmod 0755 /var/spool/parentcontrol
+
+    mkdir -p /var/spool/parentcontrol/requests
+    chown root:root /var/spool/parentcontrol/requests
+    chmod 1777 /var/spool/parentcontrol/requests
+
     install -d -m 0750 -o root -g root /var/log/parentcontrol
 
     log_step "Directories created and permissions applied."
@@ -4391,6 +4399,980 @@ PC_APPS_SH_EOF
 }
 
 # ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-queue.sh (Sub-Chunk 6.1)
+# ------------------------------------------------------------------------------
+deploy_pc_queue_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-queue.sh..."
+
+    cat << 'PC_QUEUE_SH_EOF' > /opt/parentcontrol/bin/pc-queue.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Approvals Queue & User Request Manager
+# File: /opt/parentcontrol/bin/pc-queue.sh
+#
+# Description:
+#   Manages restricted-user access requests (app unlocks, URL whitelists, file
+#   downloads). Unprivileged users can submit requests to the sticky-bit spool
+#   directory (/var/spool/parentcontrol/requests); root/admin actions ingest,
+#   approve (auto-applying the rule), deny, or remove items.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh queue --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     request --type <app|web|file|other> --target <value> [--user <name>] [--reason <text>] --json
+#     approve --id <req_id> | --target <value> --json
+#     deny    --id <req_id> | --target <value> --json
+#     remove  --id <req_id> | --target <value> --json
+#     list    --json
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="queue"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages the ParentControl approvals queue for app, web, and download requests."
+PC_SCRIPT_USAGE="pc-queue.sh --action <request|approve|deny|remove|list> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         request, approve, deny, remove, list
+      --id <req_id>           Request ID (e.g., req-20261114-123456)
+      --user <username>       Requesting user (defaults to current user)
+      --type <category>       app | web | file | other
+      --target <value>        Application name, URL/domain, or filename
+      --reason <text>         Optional note from the user"
+
+readonly PC_SPOOL_DIR="/var/spool/parentcontrol/requests"
+readonly PC_QUEUE_FILE="${PC_VAR_DIR}/queue.json"
+
+QUEUE_ACTION=""
+REQ_ID=""
+REQ_USER=""
+REQ_TYPE="app"
+REQ_TARGET=""
+REQ_REASON=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_queue_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                QUEUE_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --id)
+                REQ_ID="${2:-}"
+                shift 2
+                ;;
+            --user)
+                REQ_USER="${2:-}"
+                shift 2
+                ;;
+            --type)
+                REQ_TYPE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --target)
+                REQ_TARGET="${2:-}"
+                shift 2
+                ;;
+            --reason)
+                REQ_REASON="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-queue.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$QUEUE_ACTION" ]]; then
+        pc_emit_error "Missing required --action <request|approve|deny|remove|list>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$QUEUE_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Ensure Queue Store & Ingest Any New Spool Requests
+# ------------------------------------------------------------------------------
+ensure_queue_file() {
+    mkdir -p "$PC_VAR_DIR"
+    if [[ ! -f "$PC_QUEUE_FILE" ]]; then
+        printf '{"requests": []}\n' > "$PC_QUEUE_FILE"
+        chown root:root "$PC_QUEUE_FILE"
+        chmod 0640 "$PC_QUEUE_FILE"
+    fi
+}
+
+ingest_spool_requests() {
+    ensure_queue_file
+    [[ -d "$PC_SPOOL_DIR" ]] || return 0
+
+    python3 -c '
+import glob, json, os, sys
+
+spool_dir, queue_path = sys.argv[1:3]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+requests = data.setdefault("requests", [])
+existing_ids = {r.get("id") for r in requests}
+
+ingested = 0
+for fp in sorted(glob.glob(os.path.join(spool_dir, "req-*.json"))):
+    try:
+        with open(fp, "r", encoding="utf-8") as rf:
+            item = json.load(rf)
+        if isinstance(item, dict) and item.get("id") and item.get("target"):
+            if item["id"] not in existing_ids:
+                requests.append({
+                    "id": str(item["id"]),
+                    "user": str(item.get("user", "unknown")),
+                    "type": str(item.get("type", "Other")),
+                    "target": str(item["target"]),
+                    "reason": str(item.get("reason", "")),
+                    "status": "Pending",
+                    "created_at": str(item.get("created_at", ""))
+                })
+                existing_ids.add(item["id"])
+                ingested += 1
+        os.remove(fp)
+    except Exception:
+        # Remove malformed spool files so they do not stall ingestion
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
+
+if ingested > 0:
+    tmp_path = queue_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as wf:
+        json.dump(data, wf, indent=2)
+        wf.write("\n")
+    os.chmod(tmp_path, 0o640)
+    os.replace(tmp_path, queue_path)
+' "$PC_SPOOL_DIR" "$PC_QUEUE_FILE"
+}
+
+build_queue_state_json() {
+    ingest_spool_requests
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+reqs = data.get("requests", [])
+pending_count = sum(1 for r in reqs if str(r.get("status", "")).lower() == "pending")
+print(json.dumps({
+    "count": len(reqs),
+    "pending_count": pending_count,
+    "requests": reqs
+}))
+' "$PC_QUEUE_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Unprivileged Action: Submit a New Request to Spool Dropbox
+# ------------------------------------------------------------------------------
+handle_request() {
+    if [[ -z "$REQ_TARGET" ]]; then
+        pc_emit_error "Action 'request' requires --target <app|url|file>." 2
+        exit 2
+    fi
+
+    if [[ ! -d "$PC_SPOOL_DIR" ]]; then
+        pc_emit_error "Request spool directory does not exist: ${PC_SPOOL_DIR}" 1
+        exit 1
+    fi
+
+    local submitter="$REQ_USER"
+    if [[ -z "$submitter" ]]; then
+        submitter="$(id -un)"
+    fi
+
+    local display_type
+    case "$REQ_TYPE" in
+        app|application) display_type="App Access" ;;
+        web|url|site|domain) display_type="Web Access" ;;
+        file|download) display_type="Download File" ;;
+        *) display_type="Other" ;;
+    esac
+
+    local created_json
+    created_json="$(python3 -c '
+import datetime, json, os, random, sys
+
+spool_dir, user, req_type, target, reason = sys.argv[1:6]
+now = datetime.datetime.now(datetime.timezone.utc)
+ts = now.strftime("%Y%m%d%H%M%S")
+req_id = f"req-{ts}-{random.randint(1000, 9999)}"
+payload = {
+    "id": req_id,
+    "user": user,
+    "type": req_type,
+    "target": target.strip(),
+    "reason": reason.strip(),
+    "status": "Pending",
+    "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")
+}
+out_file = os.path.join(spool_dir, f"{req_id}.json")
+with open(out_file, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+os.chmod(out_file, 0o644)
+print(json.dumps(payload))
+' "$PC_SPOOL_DIR" "$submitter" "$display_type" "$REQ_TARGET" "$REQ_REASON")"
+
+    if [[ "${PC_JSON_OUTPUT:-${PC_OUTPUT_JSON:-0}}" -eq 1 ]]; then
+        printf '{"status": "ok", "module": "queue", "action": "request", "message": "Submitted approval request", "data": %s}\n' "$created_json"
+    else
+        printf '[OK] Submitted approval request for %s (%s)\n' "$REQ_TARGET" "$display_type"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Privileged Actions: Approve, Deny, Remove, List
+# ------------------------------------------------------------------------------
+update_request_decision() {
+    local new_status="$1" # "Approved" or "Denied"
+
+    if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
+        pc_emit_error "Action requires --id <req_id> or --target <target>." 2
+        exit 2
+    fi
+
+    ingest_spool_requests
+    pc_init_transaction
+    pc_backup_file "$PC_QUEUE_FILE"
+
+    local match_info
+    match_info="$(python3 -c '
+import json, os, sys
+
+queue_path, req_id, req_target, new_status = sys.argv[1:5]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+reqs = data.get("requests", [])
+matched = None
+for r in reversed(reqs):
+    if req_id and r.get("id") == req_id:
+        r["status"] = new_status
+        matched = r
+        break
+    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
+        if str(r.get("status", "")).lower() == "pending":
+            r["status"] = new_status
+            matched = r
+            break
+
+if not matched:
+    sys.exit(1)
+
+tmp_path = queue_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+    wf.write("\n")
+os.chmod(tmp_path, 0o640)
+os.replace(tmp_path, queue_path)
+
+print(json.dumps(matched))
+' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" "$new_status" 2>/dev/null || true)"
+
+    if [[ -z "$match_info" ]]; then
+        pc_commit_transaction
+        pc_emit_error "No matching pending request found in approvals queue." 2
+        exit 2
+    fi
+
+    # Automatically enforce rule if Approved
+    if [[ "$new_status" == "Approved" ]]; then
+        local m_type m_target
+        m_type="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("type", ""))' "$match_info")"
+        m_target="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("target", ""))' "$match_info")"
+
+        if [[ "$m_type" == "App Access" && -x "${PC_BIN_DIR}/pc-apps.sh" ]]; then
+            "${PC_BIN_DIR}/pc-apps.sh" --action allow --app "$m_target" --json >/dev/null 2>&1 || true
+        elif [[ "$m_type" == "Web Access" && -x "${PC_BIN_DIR}/pc-net-acl.sh" ]]; then
+            "${PC_BIN_DIR}/pc-net-acl.sh" --action add --list whitelist --target "$m_target" --json >/dev/null 2>&1 || true
+        fi
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Marked request as ${new_status}" "$state_json"
+}
+
+handle_remove() {
+    if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
+        pc_emit_error "Action 'remove' requires --id <req_id> or --target <target>." 2
+        exit 2
+    fi
+
+    ingest_spool_requests
+    pc_init_transaction
+    pc_backup_file "$PC_QUEUE_FILE"
+
+    local removed_count
+    removed_count="$(python3 -c '
+import json, os, sys
+
+queue_path, req_id, req_target = sys.argv[1:4]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+old_reqs = data.get("requests", [])
+kept = []
+removed = 0
+for r in old_reqs:
+    if req_id and r.get("id") == req_id:
+        removed += 1
+        continue
+    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
+        removed += 1
+        continue
+    kept.append(r)
+
+data["requests"] = kept
+tmp_path = queue_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+    wf.write("\n")
+os.chmod(tmp_path, 0o640)
+os.replace(tmp_path, queue_path)
+
+print(removed)
+' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET")"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No matching queue entry found to remove." 2
+        exit 2
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Removed ${removed_count} item(s) from approvals queue" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Retrieved approvals queue" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_queue_args "$@"
+
+    if [[ "$QUEUE_ACTION" == "request" ]]; then
+        handle_request
+        exit 0
+    fi
+
+    pc_require_root
+    pc_verify_mint
+
+    case "$QUEUE_ACTION" in
+        approve)
+            update_request_decision "Approved"
+            ;;
+        deny)
+            update_request_decision "Denied"
+            ;;
+        remove)
+            handle_remove
+            ;;
+        list)
+            handle_list
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${QUEUE_ACTION}' (expected: request, approve, deny, remove, list)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_QUEUE_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-queue.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-queue.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-maint.sh (Sub-Chunk 6.2)
+# ------------------------------------------------------------------------------
+deploy_pc_maint_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-maint.sh..."
+
+    cat << 'PC_MAINT_SH_EOF' > /opt/parentcontrol/bin/pc-maint.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Automation, Screen-Time Limits & Maintenance Manager
+# File: /opt/parentcontrol/bin/pc-maint.sh
+#
+# Description:
+#   Manages daily screen-time limits (with systemd timer enforcement and
+#   session locking), automated APT security updates, Timeshift snapshots,
+#   Trash auto-purging, and the Senior/Dementia accessibility preset.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh maint --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     time-limit    --hours <0.5..24.0> [--enabled <true|false>] --json
+#     check-time    --json
+#     set-auto      --feature <auto_updates|auto_timeshift|auto_trash_purge> --enabled <true|false> --json
+#     senior-preset --enabled <true|false> --json
+#     run-now       --json
+#     list          --json
+#     apply         --json
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="maint"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages daily screen-time limits, automated maintenance tasks, and senior presets."
+PC_SCRIPT_USAGE="pc-maint.sh --action <time-limit|check-time|set-auto|senior-preset|run-now|list|apply> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         time-limit, check-time, set-auto, senior-preset, run-now, list, apply
+      --hours <float>         Daily screen-time limit in hours (0.5 to 24.0)
+      --feature <name>        auto_updates | auto_timeshift | auto_trash_purge
+      --enabled <true|false>  Enable or disable the specified setting"
+
+readonly PC_TIMELIMIT_HELPER="/usr/local/bin/parentcontrol-timelimit-check"
+readonly PC_TIMELIMIT_SERVICE="/etc/systemd/system/parentcontrol-timelimit.service"
+readonly PC_TIMELIMIT_TIMER="/etc/systemd/system/parentcontrol-timelimit.timer"
+readonly PC_USAGE_DIR="${PC_VAR_DIR}/usage"
+
+MAINT_ACTION=""
+LIMIT_HOURS=""
+AUTO_FEATURE=""
+FEATURE_ENABLED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_maint_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                MAINT_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --hours)
+                LIMIT_HOURS="${2:-}"
+                shift 2
+                ;;
+            --feature)
+                AUTO_FEATURE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+                shift 2
+                ;;
+            --enabled)
+                FEATURE_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-maint.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$MAINT_ACTION" ]]; then
+        pc_emit_error "Missing required --action <time-limit|check-time|set-auto|senior-preset|run-now|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$MAINT_ACTION"
+}
+
+get_restricted_user() {
+    pc_ensure_config_exists
+    local r_user
+    r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]]; then
+        pc_emit_error "No restricted_user configured in config.json." 2
+        exit 2
+    fi
+    printf '%s' "$r_user"
+}
+
+# ------------------------------------------------------------------------------
+# Install / Configure Screen-Time Watcher & Systemd Timer
+# ------------------------------------------------------------------------------
+install_timelimit_units() {
+    mkdir -p "$PC_USAGE_DIR"
+    chown root:root "$PC_USAGE_DIR"
+    chmod 0750 "$PC_USAGE_DIR"
+
+    cat << 'HELPER_EOF' > "$PC_TIMELIMIT_HELPER"
+#!/usr/bin/env bash
+set -euo pipefail
+exec /opt/parentcontrol/bin/pc-maint.sh --action check-time --json >/dev/null
+HELPER_EOF
+    chown root:root "$PC_TIMELIMIT_HELPER"
+    chmod 0755 "$PC_TIMELIMIT_HELPER"
+
+    cat << 'SERVICE_EOF' > "$PC_TIMELIMIT_SERVICE"
+[Unit]
+Description=ParentControl Daily Screen-Time Enforcement Check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/parentcontrol-timelimit-check
+SERVICE_EOF
+
+    cat << 'TIMER_EOF' > "$PC_TIMELIMIT_TIMER"
+[Unit]
+Description=Run ParentControl Daily Screen-Time Check Every Minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=parentcontrol-timelimit.service
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF
+
+    chmod 0644 "$PC_TIMELIMIT_SERVICE" "$PC_TIMELIMIT_TIMER"
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+sync_timelimit_timer_state() {
+    pc_ensure_config_exists
+    local enabled
+    enabled="$(pc_json_get "automation.time_limit_enabled" 2>/dev/null || printf 'false')"
+
+    install_timelimit_units
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        if [[ "$enabled" == "true" ]]; then
+            systemctl enable --now parentcontrol-timelimit.timer >/dev/null 2>&1 || true
+        else
+            systemctl disable --now parentcontrol-timelimit.timer >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Evaluate & Enforce Today's Screen-Time Quota
+# ------------------------------------------------------------------------------
+evaluate_screen_time() {
+    pc_ensure_config_exists
+    mkdir -p "$PC_USAGE_DIR"
+
+    local r_user
+    r_user="$(get_restricted_user)"
+    local today_str
+    today_str="$(date +%Y-%m-%d)"
+    local usage_file="${PC_USAGE_DIR}/${today_str}.json"
+
+    # Check if restricted_user currently has an active graphical session
+    local is_active_session="0"
+    if command -v loginctl >/dev/null 2>&1; then
+        while read -r sid uid uname seat tty; do
+            [[ "$uname" == "$r_user" ]] || continue
+            local s_type s_state s_locked
+            s_type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+            s_state="$(loginctl show-session "$sid" -p State --value 2>/dev/null || true)"
+            s_locked="$(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null || true)"
+            if [[ "$s_type" =~ ^(x11|wayland)$ && "$s_state" == "active" && "$s_locked" != "yes" ]]; then
+                is_active_session="1"
+                break
+            fi
+        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+    fi
+
+    local eval_json
+    eval_json="$(python3 -c '
+import json, os, sys
+
+cfg_path, usage_path, r_user, active_flag = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+auto = cfg.get("automation", {})
+enabled = bool(auto.get("time_limit_enabled", False))
+limit_hours = float(auto.get("daily_limit_hours", 2.0))
+limit_minutes = max(1, int(round(limit_hours * 60)))
+
+usage = {"user": r_user, "used_minutes": 0}
+if os.path.isfile(usage_path):
+    try:
+        with open(usage_path, "r", encoding="utf-8") as uf:
+            usage = json.load(uf)
+    except Exception:
+        usage = {"user": r_user, "used_minutes": 0}
+
+used = int(usage.get("used_minutes", 0))
+if enabled and active_flag == "1":
+    used += 1
+    usage["used_minutes"] = used
+    with open(usage_path, "w", encoding="utf-8") as wf:
+        json.dump(usage, wf, indent=2)
+        wf.write("\n")
+
+remaining = max(0, limit_minutes - used)
+should_lock = enabled and (active_flag == "1") and (used >= limit_minutes)
+should_warn = enabled and (active_flag == "1") and (remaining == 5)
+
+print(json.dumps({
+    "enabled": enabled,
+    "limit_hours": limit_hours,
+    "limit_minutes": limit_minutes,
+    "used_minutes_today": used,
+    "remaining_minutes": remaining,
+    "active_session": active_flag == "1",
+    "should_warn": should_warn,
+    "should_lock": should_lock
+}))
+' "$PC_CONFIG_FILE" "$usage_file" "$r_user" "$is_active_session")"
+
+    local should_warn should_lock
+    should_warn="$(python3 -c 'import json, sys; print("1" if json.loads(sys.argv[1]).get("should_warn") else "0")' "$eval_json")"
+    should_lock="$(python3 -c 'import json, sys; print("1" if json.loads(sys.argv[1]).get("should_lock") else "0")' "$eval_json")"
+
+    if [[ "$should_warn" == "1" ]]; then
+        local r_uid
+        r_uid="$(id -u "$r_user")"
+        sudo -u "$r_user" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${r_uid}/bus" \
+            notify-send -u critical "ParentControl Screen Time" "5 minutes of daily screen time remaining." 2>/dev/null || true
+    fi
+
+    if [[ "$should_lock" == "1" ]] && command -v loginctl >/dev/null 2>&1; then
+        while read -r sid uid uname seat tty; do
+            if [[ "$uname" == "$r_user" ]]; then
+                loginctl lock-session "$sid" >/dev/null 2>&1 || true
+            fi
+        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+        pc_log "INFO" "Daily screen-time limit reached for '${r_user}'; locked active session."
+    fi
+
+    printf '%s' "$eval_json"
+}
+
+# ------------------------------------------------------------------------------
+# Automation Features & Senior Preset Enforcement
+# ------------------------------------------------------------------------------
+apply_auto_updates() {
+    local enabled="$1"
+    local val="0"
+    [[ "$enabled" == "true" ]] && val="1"
+
+    mkdir -p /etc/apt/apt.conf.d
+    cat << EOF > /etc/apt/apt.conf.d/20parentcontrol-auto-upgrades
+// Managed by ParentControl (pc-maint.sh)
+APT::Periodic::Update-Package-Lists "${val}";
+APT::Periodic::Unattended-Upgrade "${val}";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    chmod 0644 /etc/apt/apt.conf.d/20parentcontrol-auto-upgrades
+}
+
+apply_senior_preset() {
+    local enabled="$1"
+    local r_user r_uid
+    r_user="$(get_restricted_user)"
+    r_uid="$(id -u "$r_user")"
+
+    local bus_addr="unix:path=/run/user/${r_uid}/bus"
+    if [[ -S "/run/user/${r_uid}/bus" ]] && command -v gsettings >/dev/null 2>&1; then
+        if [[ "$enabled" == "true" ]]; then
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings set org.cinnamon.desktop.interface text-scaling-factor 1.25 2>/dev/null || true
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings set org.cinnamon hotcorner-layout "['scale:false:0', 'scale:false:0', 'desktop:false:0', 'desktop:false:0']" 2>/dev/null || true
+        else
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings reset org.cinnamon.desktop.interface text-scaling-factor 2>/dev/null || true
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings reset org.cinnamon hotcorner-layout 2>/dev/null || true
+        fi
+    fi
+}
+
+purge_old_trash() {
+    local r_user user_home trash_files trash_info
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+    trash_files="${user_home}/.local/share/Trash/files"
+    trash_info="${user_home}/.local/share/Trash/info"
+
+    [[ -d "$trash_files" ]] && find "$trash_files" -mindepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+    [[ -d "$trash_info" ]] && find "$trash_info" -mindepth 1 -mtime +7 -exec rm -f {} + 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Maintenance State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_maint_state_json() {
+    pc_ensure_config_exists
+    local today_str
+    today_str="$(date +%Y-%m-%d)"
+    local usage_file="${PC_USAGE_DIR}/${today_str}.json"
+
+    python3 -c '
+import json, os, sys
+
+cfg_path, usage_path = sys.argv[1:3]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+auto = cfg.get("automation", {})
+used = 0
+if os.path.isfile(usage_path):
+    try:
+        with open(usage_path, "r", encoding="utf-8") as uf:
+            used = int(json.load(uf).get("used_minutes", 0))
+    except Exception:
+        used = 0
+
+print(json.dumps({
+    "restricted_user": cfg.get("restricted_user", ""),
+    "time_limit_enabled": bool(auto.get("time_limit_enabled", False)),
+    "daily_limit_hours": float(auto.get("daily_limit_hours", 2.0)),
+    "used_minutes_today": used,
+    "auto_updates": bool(auto.get("auto_updates", False)),
+    "auto_timeshift": bool(auto.get("auto_timeshift", False)),
+    "auto_trash_purge": bool(auto.get("auto_trash_purge", False)),
+    "senior_preset": bool(auto.get("senior_preset", False))
+}))
+' "$PC_CONFIG_FILE" "$usage_file"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_time_limit() {
+    if [[ -z "$LIMIT_HOURS" ]]; then
+        pc_emit_error "Action 'time-limit' requires --hours <0.5..24.0>." 2
+        exit 2
+    fi
+
+    local valid_hours
+    if ! valid_hours="$(python3 -c '
+import sys
+try:
+    h = float(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+if h < 0.5 or h > 24.0:
+    sys.exit(1)
+print(round(h, 2))
+' "$LIMIT_HOURS")"; then
+        pc_emit_error "Invalid --hours '${LIMIT_HOURS}'. Must be between 0.5 and 24.0." 2
+        exit 2
+    fi
+
+    local enabled_flag="true"
+    if [[ "$FEATURE_ENABLED" == "false" ]]; then
+        enabled_flag="false"
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, hours_val, enabled_str, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+auto = data.setdefault("automation", {})
+auto["daily_limit_hours"] = hours_val
+auto["time_limit_enabled"] = (enabled_str == "true")
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$valid_hours" "$enabled_flag" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    sync_timelimit_timer_state
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Set daily screen-time limit to ${valid_hours} hours (enabled=${enabled_flag})" "$state_json"
+}
+
+handle_check_time() {
+    local eval_json
+    eval_json="$(evaluate_screen_time)"
+    pc_emit_result "Evaluated daily screen-time quota" "$eval_json"
+}
+
+handle_set_auto() {
+    case "$AUTO_FEATURE" in
+        auto_updates|auto_timeshift|auto_trash_purge)
+            ;;
+        *)
+            pc_emit_error "Invalid --feature '${AUTO_FEATURE}'. Must be auto_updates, auto_timeshift, or auto_trash_purge." 2
+            exit 2
+            ;;
+    esac
+
+    if [[ "$FEATURE_ENABLED" != "true" && "$FEATURE_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'set-auto' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_json_set "automation.${AUTO_FEATURE}" "$FEATURE_ENABLED"
+
+    if [[ "$AUTO_FEATURE" == "auto_updates" ]]; then
+        apply_auto_updates "$FEATURE_ENABLED"
+    elif [[ "$AUTO_FEATURE" == "auto_trash_purge" && "$FEATURE_ENABLED" == "true" ]]; then
+        purge_old_trash
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Set automation feature '${AUTO_FEATURE}' to ${FEATURE_ENABLED}" "$state_json"
+}
+
+handle_senior_preset() {
+    if [[ "$FEATURE_ENABLED" != "true" && "$FEATURE_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'senior-preset' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_json_set "automation.senior_preset" "$FEATURE_ENABLED"
+    apply_senior_preset "$FEATURE_ENABLED"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Set Senior/Dementia accessibility preset to ${FEATURE_ENABLED}" "$state_json"
+}
+
+handle_run_now() {
+    pc_ensure_config_exists
+    local ran_tasks=()
+
+    local do_trash do_timeshift
+    do_trash="$(pc_json_get "automation.auto_trash_purge" 2>/dev/null || printf 'false')"
+    do_timeshift="$(pc_json_get "automation.auto_timeshift" 2>/dev/null || printf 'false')"
+
+    if [[ "$do_trash" == "true" ]]; then
+        purge_old_trash
+        ran_tasks+=("trash_purge")
+    fi
+
+    if [[ "$do_timeshift" == "true" ]] && command -v timeshift >/dev/null 2>&1; then
+        timeshift --create --comments "ParentControl Automated Snapshot" >/dev/null 2>&1 || true
+        ran_tasks+=("timeshift_snapshot")
+    fi
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Completed immediate maintenance run (${ran_tasks[*]:-none_enabled})" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Retrieved automation and screen-time settings" "$state_json"
+}
+
+handle_apply() {
+    pc_ensure_config_exists
+    sync_timelimit_timer_state
+
+    local auto_up senior_on
+    auto_up="$(pc_json_get "automation.auto_updates" 2>/dev/null || printf 'false')"
+    senior_on="$(pc_json_get "automation.senior_preset" 2>/dev/null || printf 'false')"
+
+    apply_auto_updates "$auto_up"
+    apply_senior_preset "$senior_on"
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Applied all automation and maintenance policies" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_maint_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$MAINT_ACTION" in
+        time-limit)
+            handle_time_limit
+            ;;
+        check-time)
+            handle_check_time
+            ;;
+        set-auto)
+            handle_set_auto
+            ;;
+        senior-preset)
+            handle_senior_preset
+            ;;
+        run-now)
+            handle_run_now
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${MAINT_ACTION}' (expected: time-limit, check-time, set-auto, senior-preset, run-now, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_MAINT_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-maint.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-maint.sh
+}
+
+# ------------------------------------------------------------------------------
 # Deploy Initial Master Configuration (/etc/parentcontrol/config.json)
 # ------------------------------------------------------------------------------
 deploy_initial_config() {
@@ -4420,6 +5402,8 @@ run_self_test() {
     /opt/parentcontrol/bin/pc-ctl.sh ports --action list "${test_flags[@]}"
     /opt/parentcontrol/bin/pc-ctl.sh devices --action list "${test_flags[@]}"
     /opt/parentcontrol/bin/pc-ctl.sh apps --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh queue --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh maint --action list "${test_flags[@]}"
 }
 
 # ------------------------------------------------------------------------------
@@ -4438,12 +5422,14 @@ main() {
     deploy_pc_ports_sh
     deploy_pc_devices_sh
     deploy_pc_apps_sh
+    deploy_pc_queue_sh
+    deploy_pc_maint_sh
     deploy_initial_config
 
     if [[ "$SKIP_TEST" -eq 0 ]]; then
         run_self_test
     else
-        printf '[OK] ParentControl Part 5 deployed (self-test skipped).\n'
+        printf '[OK] ParentControl Part 6 deployed (self-test skipped).\n'
     fi
 }
 
