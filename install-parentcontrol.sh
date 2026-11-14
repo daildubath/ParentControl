@@ -20,23 +20,51 @@ SKIP_TEST=0
 # Help & CLI Tag Parsing
 # ------------------------------------------------------------------------------
 show_help() {
-    cat <<EOF
-ParentControl Bootstrap Installer v${INSTALLER_VERSION}
+    cat << 'HELP_EOF'
+ParentControl (v0.1.0) — Turnkey Caregiver & Parental Control Suite for Linux Mint 22.3
 
-Description:
-  Creates the ParentControl system directories, deploys core configuration
-  and shared Bash libraries (defaults.conf, common.sh), applies strict file
-  permissions, and runs an automated environment self-test.
+DESCRIPTION:
+  Deploys and manages a PolicyKit-isolated administrative control suite for Linux
+  Mint 22.3 (Cinnamon). Separates a dedicated administrator account ('pcadmin')
+  from the monitored desktop user ('mint'), enforces system-wide network, folder,
+  port, hardware, application, and screen-time policies, and provides an unprivileged
+  "Caregiver Help & Request Access" popup for the monitored user.
 
-Usage:
-  sudo bash install-parentcontrol.sh [OPTIONS]
+USAGE:
+  sudo ./install-parentcontrol.sh [OPTIONS]
 
-Tags / Options:
-  -v, --verbose     Enable detailed step-by-step progress output
-      --force-os    Bypass strict Linux Mint 22.3 OS version validation
-      --skip-test   Skip the automated post-install self-test
-  -h, --help        Show this help message and exit
-EOF
+OPTIONS:
+  -h, --help            Display this complete help message and exit (does not require root).
+  -v, --verbose         Enable detailed step-by-step diagnostic logging during execution.
+      --dry-run         Validate pre-flight system requirements without modifying any files.
+      --skip-selftest   Deploy all scripts and configurations without running the post-install
+                        automated verification self-test suite.
+      --uninstall       Cleanly revert ParentControl rules (/etc/hosts blocks, UFW port rules,
+                        device locks, folder ACLs, sudo/adm group membership, systemd units,
+                        PolicyKit rules, and /opt/parentcontrol).
+      --purge           When combined with --uninstall, also remove /etc/parentcontrol,
+                        /var/lib/parentcontrol, and /var/log/parentcontrol.
+
+DEPLOYED ARCHITECTURE:
+  /opt/parentcontrol/bin/pc-ctl.sh          Unified CLI dispatcher & status/log manager
+  /opt/parentcontrol/bin/pc-setup.sh        Admin separation, PolicyKit, wizard & contact info
+  /opt/parentcontrol/bin/pc-net-acl.sh      Whitelist, greylist, blacklist & blocklist feeds
+  /opt/parentcontrol/bin/pc-perms.sh        Folder access modes (locked/read-only/drop-box/full)
+  /opt/parentcontrol/bin/pc-ports.sh        UFW firewall port & risky-service blocking
+  /opt/parentcontrol/bin/pc-devices.sh      Hardware locks (USB storage, webcam, mic, bluetooth)
+  /opt/parentcontrol/bin/pc-apps.sh         Desktop app scanner, Allow/Block ACLs & installer lock
+  /opt/parentcontrol/bin/pc-queue.sh        Unprivileged request dropbox & admin approval queue
+  /opt/parentcontrol/bin/pc-maint.sh        Screen-time limits, maintenance & Dementia/Senior preset
+  /opt/parentcontrol/gui/pc-request-popup.py Unprivileged user Request Access & caregiver dialog
+  /usr/local/bin/pc-ctl                     Global CLI symlink to pc-ctl.sh
+  /etc/parentcontrol/config.json            Master JSON configuration (root:root 0640)
+
+EXAMPLES:
+  sudo ./install-parentcontrol.sh --verbose
+  sudo pc-ctl --help
+  sudo pc-ctl perms --help
+  sudo pc-ctl setup --action wizard
+HELP_EOF
 }
 
 parse_args() {
@@ -659,21 +687,33 @@ set -Eeuo pipefail
 source "/opt/parentcontrol/lib/common.sh"
 
 PC_MODULE_NAME="ctl"
-PC_CURRENT_ACTION="dispatch"
-PC_SCRIPT_DESC="Master CLI dispatcher for all ParentControl backend modules."
-PC_SCRIPT_USAGE="pc-ctl <module> [OPTIONS]"
-PC_SCRIPT_FLAGS="  Modules:
-      setup     Provision pcadmin, run setup wizard, configure caregiver contact
-      acl       Manage Web/Network whitelist, greylist, blacklist & feeds
-      perms     Manage directory permissions (RWX / modes) & home hardening
-      ports     Manage UFW port blocks & risky port presets
-      devices   Manage hardware peripheral locks (USB, webcam, mic, BT)
-      apps      Manage application Allow/Block rules & installer locks
-      queue     Manage user access requests & approvals queue
-      maint     Manage daily screen-time limits, automation & senior preset
-      config    Read or update keys in /etc/parentcontrol/config.json
-      logs      Read or clear audit log entries
-      status    Return full system, admin, accessibility & recent log status"
+PC_CURRENT_ACTION="status"
+PC_SCRIPT_DESC="Unified CLI controller for ParentControl modules, system health checks, configuration keys, and audit logs."
+PC_SCRIPT_USAGE="pc-ctl <module> --action <verb> [MODULE_OPTIONS] [--json] [--verbose] [--help]"
+PC_SCRIPT_FLAGS="  MODULES:
+      status                  Check overall system status, admin setup, and recent logs
+      logs                    Read or clear /var/log/parentcontrol/parentcontrol.log
+      setup                   Manage pcadmin separation, PolicyKit, caregiver contact, and setup wizard
+      acl                     Manage web whitelist/greylist/blacklist and StevenBlack/Phishing Army feeds
+      perms                   Manage directory permissions (locked, read-only, drop-box, full) & presets
+      ports                   Manage UFW firewall blocked ports and risky port presets
+      devices                 Manage hardware device locks (usb_storage, webcam, microphone, bluetooth)
+      apps                    Scan installed apps, set Allow/Block rules, and lock software installers
+      queue                   Submit, list, approve, deny, or remove user access requests
+      maint                   Manage daily screen-time limits, maintenance, and Senior/Dementia preset
+
+  GLOBAL FLAGS:
+      -h, --help              Show this help message (use 'pc-ctl <module> --help' for module flags)
+      -v, --verbose           Print detailed diagnostic messages to stderr
+          --json              Emit machine-readable JSON output for GUI and automation integration
+
+  BUILT-IN CTL ACTIONS (pc-ctl status|logs ...):
+      --action check          Retrieve full system health and configuration summary (module: status)
+      --action get --key <k>  Read a dot-notation key from /etc/parentcontrol/config.json
+      --action set --key <k> --value <v>
+                              Update a configuration key in /etc/parentcontrol/config.json
+      --action read           Read recent audit log entries (supports --lines <N>, default 50)
+      --action clear          Truncate the audit log file (module: logs)"
 
 handle_status() {
     pc_parse_common_flags "$@"
@@ -2020,9 +2060,9 @@ normalize_rwx_and_label() {
 
     if [[ -n "$mode" ]]; then
         case "$mode" in
-            locked|none|block)     printf '---|Locked (No Access)'; return 0 ;;
+            locked|none|block)     printf '%s' '---|Locked (No Access)'; return 0 ;;
             read-only|readonly|ro) printf 'R-X|Read-Only'; return 0 ;;
-            drop-box|dropbox|wo)   printf '-WX|Drop-Box (Write Only)'; return 0 ;;
+            drop-box|dropbox|wo)   printf '%s' '-WX|Drop-Box (Write Only)'; return 0 ;;
             full|rw|rwx|allow)     printf 'RWX|Full Access'; return 0 ;;
             *) pc_emit_error "Invalid --mode '${mode}' (expected: locked, read-only, drop-box, full)." 2; exit 2 ;;
         esac
