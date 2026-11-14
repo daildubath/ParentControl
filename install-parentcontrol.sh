@@ -1550,21 +1550,8 @@ with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
 net = cfg.get("network", {})
-def expand_variants(items):
-    out = set()
-    for x in items:
-        d = x.lower().strip(".")
-        if not d:
-            continue
-        out.add(d)
-        if d.startswith("www."):
-            out.add(d[4:])
-        else:
-            out.add("www." + d)
-    return out
-
-whitelist = expand_variants(net.get("whitelist", []))
-greylist = expand_variants(net.get("greylist", []))
+whitelist = {x.lower() for x in net.get("whitelist", [])}
+greylist = {x.lower() for x in net.get("greylist", [])}
 allowed = whitelist | greylist
 blacklist = [x.lower() for x in net.get("blacklist", [])]
 sources = net.get("feed_sources", {})
@@ -1616,7 +1603,6 @@ PYEOF
     chown root:root "$tmp_hosts"
     chmod 0644 "$tmp_hosts"
     mv "$tmp_hosts" "$PC_HOSTS_FILE"
-    resolvectl flush-caches >/dev/null 2>&1 || true
 }
 
 build_acl_state_json() {
@@ -1923,7 +1909,7 @@ PC_NET_ACL_SH_EOF
 }
 
 # ------------------------------------------------------------------------------
-# Deploy /opt/parentcontrol/bin/pc-perms.sh (Sub-Chunk 9.1)
+# Deploy /opt/parentcontrol/bin/pc-perms.sh (Part 3)
 # ------------------------------------------------------------------------------
 deploy_pc_perms_sh() {
     log_step "Writing /opt/parentcontrol/bin/pc-perms.sh..."
@@ -1945,8 +1931,8 @@ PC_CURRENT_ACTION="list"
 PC_SCRIPT_DESC="Manages directory access rules (locked, read-only, drop-box, full, or RWX) and home-directory hardening."
 PC_SCRIPT_USAGE="pc-perms.sh --action <set|remove|preset|list|apply> [OPTIONS]"
 PC_SCRIPT_FLAGS="      --action <verb>         set, remove, preset, list, apply
-      --path <dir>            Target folder or file (relative paths resolve inside restricted user's home)
-      --perms <RWX>           3-character permission mask (e.g., R-X, ---, -WX, RWX)
+      --path <dir>            Target folder (relative paths resolve inside restricted user's home)
+      --perms <RWX>           3-character permission mask (e.g., R-X, ---, RWX)
       --mode <level>          Intuitive access level: locked | read-only | drop-box | full
       --name <preset>         lock_dotfiles | restrict_extra_home_dirs | noexec_user_dirs
       --enabled <true|false>  Enable or disable preset"
@@ -1981,21 +1967,10 @@ parse_perms_args() {
     PC_CURRENT_ACTION="$PERMS_ACTION"
 }
 
-ensure_acl_tool() {
-    if ! command -v setfacl >/dev/null 2>&1; then
-        pc_log "INFO" "setfacl not found; installing 'acl' package..."
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
-    fi
-}
-
 get_restricted_user() {
     pc_ensure_config_exists
     local r_user
     r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
-    if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
-        r_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $1 != "'"$PC_ADMIN_USER"'" {print $1; exit}' /etc/passwd)"
-    fi
     if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
         pc_emit_error "Valid restricted_user is not configured in config.json." 2
         exit 2
@@ -2028,7 +2003,7 @@ forbidden = {
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
     "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"
 }
-if resolved in forbidden or resolved == os.path.abspath(home):
+if resolved in forbidden:
     sys.exit(2)
 
 print(resolved)
@@ -2051,7 +2026,7 @@ normalize_rwx_and_label() {
     fi
 
     if [[ ! "$raw_perms" =~ ^[R-][W-][X-]$ ]]; then
-        pc_emit_error "Invalid --perms '${raw_perms}'. Must be 3 chars like R-X, ---, -WX, or RWX." 2
+        pc_emit_error "Invalid --perms '${raw_perms}'. Must be 3 chars like R-X, ---, or RWX." 2
         exit 2
     fi
 
@@ -2078,104 +2053,29 @@ apply_single_acl_rule() {
     local r_user="$1"
     local target_path="$2"
     local rwx="$3"
-    local orig_owner="${4:-$r_user}"
-    local orig_group="${5:-$(id -gn "$r_user")}"
-    local orig_mode="${6:-}"
+    local acl_str
+    acl_str="$(printf '%s' "$rwx" | tr '[:upper:]' '[:lower:]')"
 
     [[ -e "$target_path" ]] || return 0
-    ensure_acl_tool
-
-    # Full Access: restore original ownership, clear ACLs, and ensure owner RWX
-    if [[ "$rwx" == "RWX" ]]; then
-        setfacl -R -b "$target_path" 2>/dev/null || true
-        chown -R "${orig_owner}:${orig_group}" "$target_path"
-        if [[ -n "$orig_mode" ]]; then
-            chmod "$orig_mode" "$target_path" 2>/dev/null || true
-        fi
-        chmod -R u+rwX "$target_path" 2>/dev/null || true
-        return 0
-    fi
-
-    # Restrictive modes (---, R-X, -WX, or custom):
-    # Transfer ownership to root:root so the kernel evaluates named user ACLs
-    # (u:<r_user>:...) rather than bypassing them via file-owner (user::rwx) bits.
-    chown -R root:root "$target_path"
-    setfacl -R -b "$target_path" 2>/dev/null || true
-
-    if [[ "$rwx" == "---" ]]; then
-        if [[ -d "$target_path" ]]; then
-            find "$target_path" -type d -exec chmod 0700 {} +
-            find "$target_path" -type f -exec chmod 0600 {} +
-            setfacl -R -m "u:${r_user}:---" "$target_path"
-            find "$target_path" -type d -exec setfacl -m "d:u:${r_user}:---" {} +
-        else
-            chmod 0600 "$target_path"
-            setfacl -m "u:${r_user}:---" "$target_path"
-        fi
-        return 0
-    fi
-
-    if [[ "$rwx" == "R-X" ]]; then
-        if [[ -d "$target_path" ]]; then
-            find "$target_path" -type d -exec chmod 0750 {} +
-            find "$target_path" -type f -exec chmod 0640 {} +
-            find "$target_path" -type d -exec setfacl -m "u:${r_user}:r-x,d:u:${r_user}:r-x" {} +
-            find "$target_path" -type f -exec setfacl -m "u:${r_user}:r--" {} +
-        else
-            chmod 0640 "$target_path"
-            setfacl -m "u:${r_user}:r--" "$target_path"
-        fi
-        return 0
-    fi
-
-    if [[ "$rwx" == "-WX" ]]; then
-        if [[ -d "$target_path" ]]; then
-            find "$target_path" -type d -exec chmod 0730 {} +
-            find "$target_path" -type f -exec chmod 0620 {} +
-            find "$target_path" -type d -exec setfacl -m "u:${r_user}:-wx,d:u:${r_user}:-w-" {} +
-            find "$target_path" -type f -exec setfacl -m "u:${r_user}:-w-" {} +
-        else
-            chmod 0620 "$target_path"
-            setfacl -m "u:${r_user}:-w-" "$target_path"
-        fi
-        return 0
-    fi
-
-    # Custom 3-char RWX mask (e.g., R--, --X, RW-)
-    local file_acl dir_acl r_c w_c x_c
-    file_acl="$(printf '%s' "$rwx" | tr '[:upper:]' '[:lower:]')"
-    r_c="${file_acl:0:1}"
-    w_c="${file_acl:1:1}"
-    x_c="${file_acl:2:1}"
-    if [[ ( "$r_c" == "r" || "$w_c" == "w" ) && "$x_c" == "-" ]]; then
-        x_c="x"
-    fi
-    dir_acl="${r_c}${w_c}${x_c}"
 
     if [[ -d "$target_path" ]]; then
-        find "$target_path" -type d -exec chmod 0750 {} +
-        find "$target_path" -type f -exec chmod 0640 {} +
-        find "$target_path" -type d -exec setfacl -m "u:${r_user}:${dir_acl},d:u:${r_user}:${file_acl}" {} +
-        find "$target_path" -type f -exec setfacl -m "u:${r_user}:${file_acl}" {} +
+        setfacl -R -m "u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
+        setfacl -R -m "d:u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
     else
-        chmod 0640 "$target_path"
-        setfacl -m "u:${r_user}:${file_acl}" "$target_path"
+        setfacl -m "u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
     fi
 }
 
 enforce_all_perms() {
     local r_user="$1"
-    local r_group user_home
-    r_group="$(id -gn "$r_user")"
+    local user_home
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
-    ensure_acl_tool
     pc_ensure_config_exists
 
     local dump
-    dump="$(python3 - "$PC_CONFIG_FILE" "$r_user" "$r_group" << 'PYEOF'
+    dump="$(python3 - "$PC_CONFIG_FILE" << 'PYEOF'
 import json, sys
 cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-def_owner, def_group = sys.argv[2], sys.argv[3]
 perms = cfg.get("permissions", {})
 presets = perms.get("presets", {})
 print("PRESET|lock_dotfiles|" + ("1" if presets.get("lock_dotfiles") else "0"))
@@ -2184,64 +2084,39 @@ print("PRESET|noexec_user_dirs|" + ("1" if presets.get("noexec_user_dirs") else 
 for r in perms.get("custom_rules", []):
     p_val = r.get("path", "")
     r_val = r.get("perms", "R-X")
-    o_own = r.get("orig_owner", def_owner)
-    o_grp = r.get("orig_group", def_group)
-    o_mod = r.get("orig_mode", "")
-    print(f"RULE|{p_val}|{r_val}|{o_own}|{o_grp}|{o_mod}")
+    print(f"RULE|{p_val}|{r_val}")
 PYEOF
 )"
 
     local lock_dot="0" restrict_extra="0" noexec_dirs="0"
-    while IFS='|' read -r kind a b c d e; do
+    while IFS='|' read -r kind a b; do
         if [[ "$kind" == "PRESET" ]]; then
             [[ "$a" == "lock_dotfiles" ]] && lock_dot="$b"
             [[ "$a" == "restrict_extra_home_dirs" ]] && restrict_extra="$b"
             [[ "$a" == "noexec_user_dirs" ]] && noexec_dirs="$b"
         elif [[ "$kind" == "RULE" && -n "$a" ]]; then
-            apply_single_acl_rule "$r_user" "$a" "$b" "$c" "$d" "$e"
+            apply_single_acl_rule "$r_user" "$a" "$b"
         fi
     done <<< "$dump"
 
-    # Preset 1: Protect shell dotfiles
-    for df in ".bashrc" ".profile" ".bash_aliases" ".zshrc" ".xsessionrc"; do
+    for df in ".bashrc" ".profile" ".bash_aliases" ".zshrc"; do
         local fpath="${user_home}/${df}"
         if [[ -f "$fpath" ]]; then
             if [[ "$lock_dot" == "1" ]]; then
                 chown root:root "$fpath"
                 chmod 0644 "$fpath"
             else
-                chown "${r_user}:${r_group}" "$fpath"
+                chown "${r_user}:$(id -gn "$r_user")" "$fpath"
             fi
         fi
     done
 
-    # Preset 2: Restrict access to other users' home directories
-    if [[ -d /home ]]; then
-        for hdir in /home/*; do
-            [[ -d "$hdir" ]] || continue
-            local howner
-            howner="$(stat -c '%U' "$hdir" 2>/dev/null || true)"
-            if [[ -n "$howner" && "$howner" != "$r_user" && "$howner" != "root" && "$howner" != "$PC_ADMIN_USER" ]]; then
-                if [[ "$restrict_extra" == "1" ]]; then
-                    chmod 0750 "$hdir" 2>/dev/null || true
-                    setfacl -m "u:${r_user}:---" "$hdir" 2>/dev/null || true
-                else
-                    setfacl -x "u:${r_user}" "$hdir" 2>/dev/null || true
-                fi
-            fi
+    if [[ "$noexec_dirs" == "1" ]]; then
+        for d in "${user_home}/Downloads" "${user_home}/Desktop" "/tmp"; do
+            [[ -d "$d" ]] && setfacl -R -m "u:${r_user}:rw-" "$d" 2>/dev/null || true
+            [[ -d "$d" ]] && setfacl -m "u:${r_user}:rwx" "$d" 2>/dev/null || true
         done
     fi
-
-    # Preset 3: Block running executables from Downloads & Desktop
-    for d in "${user_home}/Downloads" "${user_home}/Desktop"; do
-        [[ -d "$d" ]] || continue
-        if [[ "$noexec_dirs" == "1" ]]; then
-            find "$d" -type f -exec chmod a-x {} + 2>/dev/null || true
-            setfacl -m "d:m::rw-" "$d" 2>/dev/null || true
-        else
-            setfacl -x "d:m" "$d" 2>/dev/null || true
-        fi
-    done
 }
 
 build_perms_state_json() {
@@ -2267,15 +2142,14 @@ PYEOF
 handle_set() {
     [[ -z "$TARGET_PATH" ]] && { pc_emit_error "Missing --path <directory>." 2; exit 2; }
 
-    local r_user r_group user_home resolved_path
+    local r_user user_home resolved_path
     r_user="$(get_restricted_user)"
-    r_group="$(id -gn "$r_user")"
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
 
     local rc=0
     resolved_path="$(resolve_safe_user_path "$TARGET_PATH" "$user_home")" || rc=$?
     if [[ "$rc" -eq 2 ]]; then
-        pc_emit_error "Refusing to modify protected system or top-level home directory: '${TARGET_PATH}'" 2
+        pc_emit_error "Refusing to modify protected system directory: '${TARGET_PATH}'" 2
         exit 2
     elif [[ "$rc" -ne 0 || ! -e "$resolved_path" ]]; then
         pc_emit_error "Target path does not exist: '${resolved_path:-$TARGET_PATH}'" 2
@@ -2286,62 +2160,33 @@ handle_set() {
     norm_info="$(normalize_rwx_and_label "$TARGET_MODE" "$TARGET_PERMS" "$resolved_path")"
     IFS='|' read -r rwx_val mode_label <<< "$norm_info"
 
-    local cur_owner cur_group cur_mode
-    cur_owner="$(stat -c '%U' "$resolved_path")"
-    cur_group="$(stat -c '%G' "$resolved_path")"
-    cur_mode="$(stat -c '%a' "$resolved_path")"
-
     pc_init_transaction
     pc_backup_file "$PC_CONFIG_FILE"
 
-    local tmp_cfg saved_meta
+    local tmp_cfg
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
 
-    saved_meta="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$cur_owner" "$cur_group" "$cur_mode" "$r_user" "$r_group" "$tmp_cfg" << 'PYEOF'
+    python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$tmp_cfg" << 'PYEOF'
 import json, sys
 
-cfg_path, path_val, rwx_str, label_str, cur_own, cur_grp, cur_mod, def_own, def_grp, out_path = sys.argv[1:11]
+cfg_path, path_val, rwx_str, label_str, out_path = sys.argv[1:6]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
 perms = data.setdefault("permissions", {"presets": {}, "custom_rules": []})
-
-existing = next((r for r in perms.get("custom_rules", []) if r.get("path") == path_val), None)
-if existing and existing.get("orig_owner"):
-    orig_owner = existing["orig_owner"]
-    orig_group = existing.get("orig_group", def_grp)
-    orig_mode = existing.get("orig_mode", cur_mod)
-else:
-    orig_owner = def_own if cur_own == "root" and path_val.startswith(f"/home/{def_own}/") else cur_own
-    orig_group = def_grp if cur_own == "root" and path_val.startswith(f"/home/{def_own}/") else cur_grp
-    orig_mode = cur_mod
-
 rules = [r for r in perms.get("custom_rules", []) if r.get("path") != path_val]
-rules.append({
-    "path": path_val,
-    "perms": rwx_str,
-    "label": label_str,
-    "orig_owner": orig_owner,
-    "orig_group": orig_group,
-    "orig_mode": orig_mode
-})
+rules.append({"path": path_val, "perms": rwx_str, "label": label_str})
 rules.sort(key=lambda x: x.get("path", ""))
 perms["custom_rules"] = rules
 
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-
-print(f"{orig_owner}|{orig_group}|{orig_mode}")
 PYEOF
-)"
-
-    local orig_owner orig_group orig_mode
-    IFS='|' read -r orig_owner orig_group orig_mode <<< "$saved_meta"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
     mv "$tmp_cfg" "$PC_CONFIG_FILE"
 
-    apply_single_acl_rule "$r_user" "$resolved_path" "$rwx_val" "$orig_owner" "$orig_group" "$orig_mode"
+    apply_single_acl_rule "$r_user" "$resolved_path" "$rwx_val"
     pc_commit_transaction
 
     pc_emit_result "Set permissions on '${resolved_path}' to ${mode_label} (${rwx_val})" "$(build_perms_state_json)"
@@ -2350,38 +2195,30 @@ PYEOF
 handle_remove() {
     [[ -z "$TARGET_PATH" ]] && { pc_emit_error "Missing --path <directory>." 2; exit 2; }
 
-    local r_user r_group user_home resolved_path
+    local r_user user_home resolved_path
     r_user="$(get_restricted_user)"
-    r_group="$(id -gn "$r_user")"
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
     resolved_path="$(resolve_safe_user_path "$TARGET_PATH" "$user_home" 2>/dev/null || printf '%s' "$TARGET_PATH")"
 
     pc_init_transaction
     pc_backup_file "$PC_CONFIG_FILE"
 
-    local tmp_cfg removed_info
+    local tmp_cfg removed
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
-    removed_info="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$r_user" "$r_group" "$tmp_cfg" << 'PYEOF'
+    removed="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg" << 'PYEOF'
 import json, sys
-cfg_path, p_val, def_own, def_grp, out_path = sys.argv[1:6]
+cfg_path, p_val, out_path = sys.argv[1:4]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
 perms = data.setdefault("permissions", {"presets": {}, "custom_rules": []})
 old = perms.get("custom_rules", [])
-match = next((r for r in old if r.get("path") == p_val), None)
 new = [r for r in old if r.get("path") != p_val]
 perms["custom_rules"] = new
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-if match:
-    print(f"1|{match.get('orig_owner', def_own)}|{match.get('orig_group', def_grp)}|{match.get('orig_mode', '')}")
-else:
-    print("0|||")
+print("1" if len(new) != len(old) else "0")
 PYEOF
 )"
-
-    local removed orig_owner orig_group orig_mode
-    IFS='|' read -r removed orig_owner orig_group orig_mode <<< "$removed_info"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
@@ -2394,17 +2231,12 @@ PYEOF
     fi
 
     if [[ -e "$resolved_path" ]]; then
-        ensure_acl_tool
-        setfacl -R -b "$resolved_path" 2>/dev/null || true
-        chown -R "${orig_owner:-$r_user}:${orig_group:-$r_group}" "$resolved_path"
-        if [[ -n "$orig_mode" ]]; then
-            chmod "$orig_mode" "$resolved_path" 2>/dev/null || true
-        fi
-        chmod -R u+rwX "$resolved_path" 2>/dev/null || true
+        setfacl -R -x "u:${r_user}" "$resolved_path" 2>/dev/null || true
+        setfacl -R -x "d:u:${r_user}" "$resolved_path" 2>/dev/null || true
     fi
 
     pc_commit_transaction
-    pc_emit_result "Removed permission rule and restored access for '${resolved_path}'" "$(build_perms_state_json)"
+    pc_emit_result "Removed permission rule for '${resolved_path}'" "$(build_perms_state_json)"
 }
 
 handle_preset() {
@@ -4088,8 +3920,25 @@ deploy_pc_queue_sh() {
     cat << 'PC_QUEUE_SH_EOF' > /opt/parentcontrol/bin/pc-queue.sh
 #!/usr/bin/env bash
 # ==============================================================================
-# ParentControl - Unprivileged Request Dropbox & Admin Approvals Queue
+# ParentControl - Approvals Queue & User Request Manager
 # File: /opt/parentcontrol/bin/pc-queue.sh
+#
+# Description:
+#   Manages restricted-user access requests (app unlocks, URL whitelists, file
+#   downloads). Unprivileged users can submit requests to the sticky-bit spool
+#   directory (/var/spool/parentcontrol/requests); root/admin actions ingest,
+#   approve (auto-applying the rule), deny, or remove items.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh queue --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     request --type <app|web|file|other> --target <value> [--user <name>] [--reason <text>] --json
+#     approve --id <req_id> | --target <value> --json
+#     deny    --id <req_id> | --target <value> --json
+#     remove  --id <req_id> | --target <value> --json
+#     list    --json
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -4099,50 +3948,77 @@ source "/opt/parentcontrol/lib/common.sh"
 
 PC_MODULE_NAME="queue"
 PC_CURRENT_ACTION="list"
-PC_SCRIPT_DESC="Manages unprivileged user access requests and administrator approve/deny decisions."
-PC_SCRIPT_USAGE="pc-queue.sh --action <request|list|approve|deny|remove> [OPTIONS]"
-PC_SCRIPT_FLAGS="      --action <verb>      request, list, approve, deny, remove
-      --id <req_id>        Request ID (e.g., req-20261114...)
-      --type <category>    web | app | file | other (for --action request)
-      --target <value>     Domain, application name, folder path, or topic
-      --reason <text>      Optional explanation from the user
-      --user <username>    Requesting username (auto-detected if omitted)"
+PC_SCRIPT_DESC="Manages the ParentControl approvals queue for app, web, and download requests."
+PC_SCRIPT_USAGE="pc-queue.sh --action <request|approve|deny|remove|list> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         request, approve, deny, remove, list
+      --id <req_id>           Request ID (e.g., req-20261114-123456)
+      --user <username>       Requesting user (defaults to current user)
+      --type <category>       app | web | file | other
+      --target <value>        Application name, URL/domain, or filename
+      --reason <text>         Optional note from the user"
 
-PC_QUEUE_FILE="${PC_QUEUE_FILE:-/var/lib/parentcontrol/queue.json}"
-PC_SPOOL_DIR="${PC_SPOOL_DIR:-/var/spool/parentcontrol/requests}"
+readonly PC_SPOOL_DIR="/var/spool/parentcontrol/requests"
+readonly PC_QUEUE_FILE="${PC_VAR_DIR}/queue.json"
 
 QUEUE_ACTION=""
 REQ_ID=""
-REQ_TYPE="other"
+REQ_USER=""
+REQ_TYPE="app"
 REQ_TARGET=""
 REQ_REASON=""
-REQ_USER=""
 
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
 parse_queue_args() {
     pc_parse_common_flags "$@"
     set -- "${PC_REMAINING_ARGS[@]}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --action) QUEUE_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
-            --id)     REQ_ID="${2:-}"; shift 2 ;;
-            --type)   REQ_TYPE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
-            --target) REQ_TARGET="${2:-}"; shift 2 ;;
-            --reason) REQ_REASON="${2:-}"; shift 2 ;;
-            --user)   REQ_USER="${2:-}"; shift 2 ;;
-            *) pc_emit_error "Unknown flag for pc-queue.sh: $1" 2; exit 2 ;;
+            --action)
+                QUEUE_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --id)
+                REQ_ID="${2:-}"
+                shift 2
+                ;;
+            --user)
+                REQ_USER="${2:-}"
+                shift 2
+                ;;
+            --type)
+                REQ_TYPE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --target)
+                REQ_TARGET="${2:-}"
+                shift 2
+                ;;
+            --reason)
+                REQ_REASON="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-queue.sh: $1" 2
+                exit 2
+                ;;
         esac
     done
 
     if [[ -z "$QUEUE_ACTION" ]]; then
-        pc_emit_error "Missing required --action flag." 2
+        pc_emit_error "Missing required --action <request|approve|deny|remove|list>." 2
         exit 2
     fi
     PC_CURRENT_ACTION="$QUEUE_ACTION"
 }
 
+# ------------------------------------------------------------------------------
+# Ensure Queue Store & Ingest Any New Spool Requests
+# ------------------------------------------------------------------------------
 ensure_queue_file() {
-    mkdir -p "$(dirname "$PC_QUEUE_FILE")"
+    mkdir -p "$PC_VAR_DIR"
     if [[ ! -f "$PC_QUEUE_FILE" ]]; then
         printf '{"requests": []}\n' > "$PC_QUEUE_FILE"
         chown root:root "$PC_QUEUE_FILE"
@@ -4152,143 +4028,139 @@ ensure_queue_file() {
 
 ingest_spool_requests() {
     ensure_queue_file
-    mkdir -p "$PC_SPOOL_DIR"
+    [[ -d "$PC_SPOOL_DIR" ]] || return 0
 
-    python3 - "$PC_SPOOL_DIR" "$PC_QUEUE_FILE" << 'PYEOF'
+    python3 -c '
 import glob, json, os, sys
 
 spool_dir, queue_path = sys.argv[1:3]
-spool_files = sorted(glob.glob(os.path.join(spool_dir, "req-*.json")))
-if not spool_files:
-    sys.exit(0)
-
 with open(queue_path, "r", encoding="utf-8") as f:
-    qdata = json.load(f)
+    data = json.load(f)
 
-reqs = qdata.setdefault("requests", [])
-existing_ids = {r.get("id") for r in reqs}
+requests = data.setdefault("requests", [])
+existing_ids = {r.get("id") for r in requests}
 
-for sf in spool_files:
+ingested = 0
+for fp in sorted(glob.glob(os.path.join(spool_dir, "req-*.json"))):
     try:
-        with open(sf, "r", encoding="utf-8") as rf:
+        with open(fp, "r", encoding="utf-8") as rf:
             item = json.load(rf)
-        if isinstance(item, dict) and item.get("id") and item["id"] not in existing_ids:
-            reqs.append(item)
-            existing_ids.add(item["id"])
-        os.remove(sf)
+        if isinstance(item, dict) and item.get("id") and item.get("target"):
+            if item["id"] not in existing_ids:
+                requests.append({
+                    "id": str(item["id"]),
+                    "user": str(item.get("user", "unknown")),
+                    "type": str(item.get("type", "Other")),
+                    "target": str(item["target"]),
+                    "reason": str(item.get("reason", "")),
+                    "status": "Pending",
+                    "created_at": str(item.get("created_at", ""))
+                })
+                existing_ids.add(item["id"])
+                ingested += 1
+        os.remove(fp)
     except Exception:
+        # Remove malformed spool files so they do not stall ingestion
         try:
-            os.remove(sf)
+            os.remove(fp)
         except Exception:
             pass
 
-tmp_path = queue_path + ".tmp"
-with open(tmp_path, "w", encoding="utf-8") as wf:
-    json.dump(qdata, wf, indent=2)
-    wf.write("\n")
-os.chmod(tmp_path, 0o640)
-os.replace(tmp_path, queue_path)
-PYEOF
+if ingested > 0:
+    tmp_path = queue_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as wf:
+        json.dump(data, wf, indent=2)
+        wf.write("\n")
+    os.chmod(tmp_path, 0o640)
+    os.replace(tmp_path, queue_path)
+' "$PC_SPOOL_DIR" "$PC_QUEUE_FILE"
 }
 
 build_queue_state_json() {
-    ensure_queue_file
-    python3 - "$PC_QUEUE_FILE" << 'PYEOF'
+    ingest_spool_requests
+    python3 -c '
 import json, sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as f:
-    qdata = json.load(f)
+    data = json.load(f)
 
-reqs = qdata.get("requests", [])
-pending = sum(1 for r in reqs if str(r.get("status", "")).lower() == "pending")
+reqs = data.get("requests", [])
+pending_count = sum(1 for r in reqs if str(r.get("status", "")).lower() == "pending")
 print(json.dumps({
     "count": len(reqs),
-    "pending_count": pending,
+    "pending_count": pending_count,
     "requests": reqs
 }))
-PYEOF
+' "$PC_QUEUE_FILE"
 }
 
+# ------------------------------------------------------------------------------
+# Unprivileged Action: Submit a New Request to Spool Dropbox
+# ------------------------------------------------------------------------------
 handle_request() {
     if [[ -z "$REQ_TARGET" ]]; then
-        pc_emit_error "Missing --target <domain|app|file|topic> for request." 2
+        pc_emit_error "Action 'request' requires --target <app|url|file>." 2
         exit 2
     fi
 
-    local submitter="${REQ_USER:-${SUDO_USER:-${USER:-unknown}}}"
-    local type_label="Other"
+    if [[ ! -d "$PC_SPOOL_DIR" ]]; then
+        pc_emit_error "Request spool directory does not exist: ${PC_SPOOL_DIR}" 1
+        exit 1
+    fi
+
+    local submitter="$REQ_USER"
+    if [[ -z "$submitter" ]]; then
+        submitter="$(id -un)"
+    fi
+
+    local display_type
     case "$REQ_TYPE" in
-        web|website|url)       type_label="Web Access" ;;
-        app|application)       type_label="Application Unlock" ;;
-        file|folder|download)  type_label="File Download" ;;
-        other|help|message)    type_label="Other" ;;
-        *)                     type_label="$REQ_TYPE" ;;
+        app|application) display_type="App Access" ;;
+        web|url|site|domain) display_type="Web Access" ;;
+        file|download) display_type="Download File" ;;
+        *) display_type="Other" ;;
     esac
 
-    local ts req_id spool_file
-    ts="$(date -u +%Y%m%d%H%M%S)"
-    req_id="req-${ts}-$$-${RANDOM}"
-    mkdir -p "$PC_SPOOL_DIR" 2>/dev/null || true
-    spool_file="${PC_SPOOL_DIR}/${req_id}.json"
+    local created_json
+    created_json="$(python3 -c '
+import datetime, json, os, random, sys
 
-    local req_json
-    req_json="$(python3 - "$req_id" "$submitter" "$type_label" "$REQ_TARGET" "$REQ_REASON" "$spool_file" << 'PYEOF'
-import datetime, json, os, sys
-
-rid, user, rtype, target, reason, out_file = sys.argv[1:7]
-now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-obj = {
-    "id": rid,
+spool_dir, user, req_type, target, reason = sys.argv[1:6]
+now = datetime.datetime.now(datetime.timezone.utc)
+ts = now.strftime("%Y%m%d%H%M%S")
+req_id = f"req-{ts}-{random.randint(1000, 9999)}"
+payload = {
+    "id": req_id,
     "user": user,
-    "type": rtype,
+    "type": req_type,
     "target": target.strip(),
     "reason": reason.strip(),
     "status": "Pending",
-    "created_at": now
+    "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")
 }
-with open(out_file, "w", encoding="utf-8") as wf:
-    json.dump(obj, wf, indent=2)
-    wf.write("\n")
-try:
-    os.chmod(out_file, 0o664)
-except Exception:
-    pass
-print(json.dumps(obj))
-PYEOF
-)"
+out_file = os.path.join(spool_dir, f"{req_id}.json")
+with open(out_file, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+os.chmod(out_file, 0o644)
+print(json.dumps(payload))
+' "$PC_SPOOL_DIR" "$submitter" "$display_type" "$REQ_TARGET" "$REQ_REASON")"
 
-    if [[ "${PC_JSON_OUTPUT:-0}" -eq 1 ]]; then
-        printf '{"status": "ok", "module": "queue", "action": "request", "message": "Submitted approval request", "data": %s}\n' "$req_json"
+    if [[ "${PC_JSON_OUTPUT:-${PC_OUTPUT_JSON:-0}}" -eq 1 ]]; then
+        printf '{"status": "ok", "module": "queue", "action": "request", "message": "Submitted approval request", "data": %s}\n' "$created_json"
     else
-        printf '[OK] Submitted approval request (%s) for %s\n' "$req_id" "$REQ_TARGET"
+        printf '[OK] Submitted approval request for %s (%s)\n' "$REQ_TARGET" "$display_type"
     fi
 }
 
-apply_approved_action() {
-    local req_type="$1"
-    local req_target="$2"
-    local lower_type out=""
-    lower_type="$(printf '%s' "$req_type" | tr '[:upper:]' '[:lower:]')"
-
-    if [[ "$lower_type" == *"web"* || "$lower_type" == *"url"* ]]; then
-        if ! out="$("${PC_BIN_DIR}/pc-net-acl.sh" --action add --list whitelist --target "$req_target" --json 2>&1)"; then
-            pc_log "WARN" "Approval hook (acl) failed for '${req_target}': ${out}"
-        fi
-    elif [[ "$lower_type" == *"app"* ]]; then
-        if ! out="$("${PC_BIN_DIR}/pc-apps.sh" --action set --app "$req_target" --status Allow --json 2>&1)"; then
-            pc_log "WARN" "Approval hook (apps) failed for '${req_target}': ${out}"
-        fi
-    elif [[ "$lower_type" == *"file"* || "$lower_type" == *"folder"* ]]; then
-        if ! out="$("${PC_BIN_DIR}/pc-perms.sh" --action set --path "$req_target" --mode full --json 2>&1)"; then
-            pc_log "WARN" "Approval hook (perms) failed for '${req_target}': ${out}"
-        fi
-    fi
-}
-
-handle_decision() {
+# ------------------------------------------------------------------------------
+# Privileged Actions: Approve, Deny, Remove, List
+# ------------------------------------------------------------------------------
+update_request_decision() {
     local new_status="$1" # "Approved" or "Denied"
+
     if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
-        pc_emit_error "Specify --id <req_id> or --target <value>." 2
+        pc_emit_error "Action requires --id <req_id> or --target <target>." 2
         exit 2
     fi
 
@@ -4297,71 +4169,68 @@ handle_decision() {
     pc_backup_file "$PC_QUEUE_FILE"
 
     local match_info
-    match_info="$(python3 - "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" "$new_status" << 'PYEOF'
-import datetime, json, os, sys
+    match_info="$(python3 -c '
+import json, os, sys
 
-q_path, req_id, req_target, decision = sys.argv[1:5]
-with open(q_path, "r", encoding="utf-8") as f:
-    qdata = json.load(f)
+queue_path, req_id, req_target, new_status = sys.argv[1:5]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
 
-reqs = qdata.get("requests", [])
-now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+reqs = data.get("requests", [])
 matched = None
-
-# Prefer matching Pending items first
-for r in reqs:
-    if str(r.get("status", "")).lower() != "pending":
-        continue
-    if (req_id and r.get("id") == req_id) or (req_target and r.get("target", "").lower() == req_target.lower()):
+for r in reversed(reqs):
+    if req_id and r.get("id") == req_id:
+        r["status"] = new_status
         matched = r
         break
-
-# Fallback if explicit --id was provided
-if matched is None and req_id:
-    for r in reqs:
-        if r.get("id") == req_id:
+    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
+        if str(r.get("status", "")).lower() == "pending":
+            r["status"] = new_status
             matched = r
             break
 
-if matched is None:
-    print("0||")
-    sys.exit(0)
+if not matched:
+    sys.exit(1)
 
-matched["status"] = decision
-matched["decided_at"] = now
-
-tmp_path = q_path + ".tmp"
+tmp_path = queue_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as wf:
-    json.dump(qdata, wf, indent=2)
+    json.dump(data, wf, indent=2)
     wf.write("\n")
 os.chmod(tmp_path, 0o640)
-os.replace(tmp_path, q_path)
+os.replace(tmp_path, queue_path)
 
-print(f"1|{matched.get('type', '')}|{matched.get('target', '')}")
-PYEOF
-)"
+print(json.dumps(matched))
+' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" "$new_status" 2>/dev/null || true)"
 
-    local found matched_type matched_target
-    IFS='|' read -r found matched_type matched_target <<< "$match_info"
-
-    if [[ "$found" != "1" ]]; then
+    if [[ -z "$match_info" ]]; then
         pc_commit_transaction
         pc_emit_error "No matching pending request found in approvals queue." 2
         exit 2
     fi
 
-    pc_commit_transaction
+    # Automatically enforce rule if Approved
+    if [[ "$new_status" == "Approved" ]]; then
+        local m_type m_target
+        m_type="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("type", ""))' "$match_info")"
+        m_target="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("target", ""))' "$match_info")"
 
-    if [[ "$new_status" == "Approved" && -n "$matched_target" ]]; then
-        apply_approved_action "$matched_type" "$matched_target"
+        if [[ "$m_type" == "App Access" && -x "${PC_BIN_DIR}/pc-apps.sh" ]]; then
+            "${PC_BIN_DIR}/pc-apps.sh" --action allow --app "$m_target" --json >/dev/null 2>&1 || true
+        elif [[ "$m_type" == "Web Access" && -x "${PC_BIN_DIR}/pc-net-acl.sh" ]]; then
+            "${PC_BIN_DIR}/pc-net-acl.sh" --action add --list whitelist --target "$m_target" --json >/dev/null 2>&1 || true
+        fi
     fi
 
-    pc_emit_result "Marked request as ${new_status}" "$(build_queue_state_json)"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Marked request as ${new_status}" "$state_json"
 }
 
 handle_remove() {
     if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
-        pc_emit_error "Specify --id <req_id> or --target <value> to remove." 2
+        pc_emit_error "Action 'remove' requires --id <req_id> or --target <target>." 2
         exit 2
     fi
 
@@ -4370,37 +4239,58 @@ handle_remove() {
     pc_backup_file "$PC_QUEUE_FILE"
 
     local removed_count
-    removed_count="$(python3 - "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" << 'PYEOF'
+    removed_count="$(python3 -c '
 import json, os, sys
 
-q_path, req_id, req_target = sys.argv[1:4]
-with open(q_path, "r", encoding="utf-8") as f:
-    qdata = json.load(f)
+queue_path, req_id, req_target = sys.argv[1:4]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
 
-old = qdata.get("requests", [])
-new = []
-for r in old:
+old_reqs = data.get("requests", [])
+kept = []
+removed = 0
+for r in old_reqs:
     if req_id and r.get("id") == req_id:
+        removed += 1
         continue
-    if not req_id and req_target and r.get("target", "").lower() == req_target.lower():
+    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
+        removed += 1
         continue
-    new.append(r)
+    kept.append(r)
 
-qdata["requests"] = new
-tmp_path = q_path + ".tmp"
+data["requests"] = kept
+tmp_path = queue_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as wf:
-    json.dump(qdata, wf, indent=2)
+    json.dump(data, wf, indent=2)
     wf.write("\n")
 os.chmod(tmp_path, 0o640)
-os.replace(tmp_path, q_path)
-print(len(old) - len(new))
-PYEOF
-)"
+os.replace(tmp_path, queue_path)
+
+print(removed)
+' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET")"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No matching queue entry found to remove." 2
+        exit 2
+    fi
 
     pc_commit_transaction
-    pc_emit_result "Removed ${removed_count} item(s) from approvals queue" "$(build_queue_state_json)"
+
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Removed ${removed_count} item(s) from approvals queue" "$state_json"
 }
 
+handle_list() {
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Retrieved approvals queue" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
 main() {
     parse_queue_args "$@"
 
@@ -4413,21 +4303,20 @@ main() {
     pc_verify_mint
 
     case "$QUEUE_ACTION" in
-        list)
-            ingest_spool_requests
-            pc_emit_result "Retrieved approvals queue" "$(build_queue_state_json)"
-            ;;
         approve)
-            handle_decision "Approved"
+            update_request_decision "Approved"
             ;;
         deny)
-            handle_decision "Denied"
+            update_request_decision "Denied"
             ;;
         remove)
             handle_remove
             ;;
+        list)
+            handle_list
+            ;;
         *)
-            pc_emit_error "Unsupported queue action '${QUEUE_ACTION}'." 2
+            pc_emit_error "Unsupported action '${QUEUE_ACTION}' (expected: request, approve, deny, remove, list)." 2
             exit 2
             ;;
     esac
