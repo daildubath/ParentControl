@@ -301,6 +301,7 @@ DESCRIPTION
     removed or disabled, disables private browsing, and verifies the result.
     Any failure undoes the changes made during that run. Firefox must be the
     deb package (not snap or Flatpak). Changes apply after Firefox restarts.
+    See also: man ./scamshield-deploy.1, README.md and HANDOFF.md.
 
 ACTIONS
         (default)         Install: needs --xpi, --config and --user.
@@ -708,6 +709,7 @@ check_python() {
 # so its variables never leak into this script.
 read_os_field() {
     local field_name=$1
+    # shellcheck source=/dev/null  # /etc/os-release (path overridable only for tests)
     ( set +u; . "$OS_RELEASE_FILE" >/dev/null 2>&1 || true; printf '%s' "${!field_name:-}" )
 }
 
