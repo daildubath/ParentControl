@@ -1923,7 +1923,7 @@ PC_NET_ACL_SH_EOF
 }
 
 # ------------------------------------------------------------------------------
-# Deploy /opt/parentcontrol/bin/pc-perms.sh (Part 3)
+# Deploy /opt/parentcontrol/bin/pc-perms.sh (Sub-Chunk 9.1)
 # ------------------------------------------------------------------------------
 deploy_pc_perms_sh() {
     log_step "Writing /opt/parentcontrol/bin/pc-perms.sh..."
@@ -1945,8 +1945,8 @@ PC_CURRENT_ACTION="list"
 PC_SCRIPT_DESC="Manages directory access rules (locked, read-only, drop-box, full, or RWX) and home-directory hardening."
 PC_SCRIPT_USAGE="pc-perms.sh --action <set|remove|preset|list|apply> [OPTIONS]"
 PC_SCRIPT_FLAGS="      --action <verb>         set, remove, preset, list, apply
-      --path <dir>            Target folder (relative paths resolve inside restricted user's home)
-      --perms <RWX>           3-character permission mask (e.g., R-X, ---, RWX)
+      --path <dir>            Target folder or file (relative paths resolve inside restricted user's home)
+      --perms <RWX>           3-character permission mask (e.g., R-X, ---, -WX, RWX)
       --mode <level>          Intuitive access level: locked | read-only | drop-box | full
       --name <preset>         lock_dotfiles | restrict_extra_home_dirs | noexec_user_dirs
       --enabled <true|false>  Enable or disable preset"
@@ -1981,10 +1981,21 @@ parse_perms_args() {
     PC_CURRENT_ACTION="$PERMS_ACTION"
 }
 
+ensure_acl_tool() {
+    if ! command -v setfacl >/dev/null 2>&1; then
+        pc_log "INFO" "setfacl not found; installing 'acl' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
+    fi
+}
+
 get_restricted_user() {
     pc_ensure_config_exists
     local r_user
     r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
+        r_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $1 != "'"$PC_ADMIN_USER"'" {print $1; exit}' /etc/passwd)"
+    fi
     if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
         pc_emit_error "Valid restricted_user is not configured in config.json." 2
         exit 2
@@ -2017,7 +2028,7 @@ forbidden = {
     "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
     "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"
 }
-if resolved in forbidden:
+if resolved in forbidden or resolved == os.path.abspath(home):
     sys.exit(2)
 
 print(resolved)
@@ -2040,7 +2051,7 @@ normalize_rwx_and_label() {
     fi
 
     if [[ ! "$raw_perms" =~ ^[R-][W-][X-]$ ]]; then
-        pc_emit_error "Invalid --perms '${raw_perms}'. Must be 3 chars like R-X, ---, or RWX." 2
+        pc_emit_error "Invalid --perms '${raw_perms}'. Must be 3 chars like R-X, ---, -WX, or RWX." 2
         exit 2
     fi
 
@@ -2067,29 +2078,104 @@ apply_single_acl_rule() {
     local r_user="$1"
     local target_path="$2"
     local rwx="$3"
-    local acl_str
-    acl_str="$(printf '%s' "$rwx" | tr '[:upper:]' '[:lower:]')"
+    local orig_owner="${4:-$r_user}"
+    local orig_group="${5:-$(id -gn "$r_user")}"
+    local orig_mode="${6:-}"
 
     [[ -e "$target_path" ]] || return 0
+    ensure_acl_tool
+
+    # Full Access: restore original ownership, clear ACLs, and ensure owner RWX
+    if [[ "$rwx" == "RWX" ]]; then
+        setfacl -R -b "$target_path" 2>/dev/null || true
+        chown -R "${orig_owner}:${orig_group}" "$target_path"
+        if [[ -n "$orig_mode" ]]; then
+            chmod "$orig_mode" "$target_path" 2>/dev/null || true
+        fi
+        chmod -R u+rwX "$target_path" 2>/dev/null || true
+        return 0
+    fi
+
+    # Restrictive modes (---, R-X, -WX, or custom):
+    # Transfer ownership to root:root so the kernel evaluates named user ACLs
+    # (u:<r_user>:...) rather than bypassing them via file-owner (user::rwx) bits.
+    chown -R root:root "$target_path"
+    setfacl -R -b "$target_path" 2>/dev/null || true
+
+    if [[ "$rwx" == "---" ]]; then
+        if [[ -d "$target_path" ]]; then
+            find "$target_path" -type d -exec chmod 0700 {} +
+            find "$target_path" -type f -exec chmod 0600 {} +
+            setfacl -R -m "u:${r_user}:---" "$target_path"
+            find "$target_path" -type d -exec setfacl -m "d:u:${r_user}:---" {} +
+        else
+            chmod 0600 "$target_path"
+            setfacl -m "u:${r_user}:---" "$target_path"
+        fi
+        return 0
+    fi
+
+    if [[ "$rwx" == "R-X" ]]; then
+        if [[ -d "$target_path" ]]; then
+            find "$target_path" -type d -exec chmod 0750 {} +
+            find "$target_path" -type f -exec chmod 0640 {} +
+            find "$target_path" -type d -exec setfacl -m "u:${r_user}:r-x,d:u:${r_user}:r-x" {} +
+            find "$target_path" -type f -exec setfacl -m "u:${r_user}:r--" {} +
+        else
+            chmod 0640 "$target_path"
+            setfacl -m "u:${r_user}:r--" "$target_path"
+        fi
+        return 0
+    fi
+
+    if [[ "$rwx" == "-WX" ]]; then
+        if [[ -d "$target_path" ]]; then
+            find "$target_path" -type d -exec chmod 0730 {} +
+            find "$target_path" -type f -exec chmod 0620 {} +
+            find "$target_path" -type d -exec setfacl -m "u:${r_user}:-wx,d:u:${r_user}:-w-" {} +
+            find "$target_path" -type f -exec setfacl -m "u:${r_user}:-w-" {} +
+        else
+            chmod 0620 "$target_path"
+            setfacl -m "u:${r_user}:-w-" "$target_path"
+        fi
+        return 0
+    fi
+
+    # Custom 3-char RWX mask (e.g., R--, --X, RW-)
+    local file_acl dir_acl r_c w_c x_c
+    file_acl="$(printf '%s' "$rwx" | tr '[:upper:]' '[:lower:]')"
+    r_c="${file_acl:0:1}"
+    w_c="${file_acl:1:1}"
+    x_c="${file_acl:2:1}"
+    if [[ ( "$r_c" == "r" || "$w_c" == "w" ) && "$x_c" == "-" ]]; then
+        x_c="x"
+    fi
+    dir_acl="${r_c}${w_c}${x_c}"
 
     if [[ -d "$target_path" ]]; then
-        setfacl -R -m "u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
-        setfacl -R -m "d:u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
+        find "$target_path" -type d -exec chmod 0750 {} +
+        find "$target_path" -type f -exec chmod 0640 {} +
+        find "$target_path" -type d -exec setfacl -m "u:${r_user}:${dir_acl},d:u:${r_user}:${file_acl}" {} +
+        find "$target_path" -type f -exec setfacl -m "u:${r_user}:${file_acl}" {} +
     else
-        setfacl -m "u:${r_user}:${acl_str}" "$target_path" 2>/dev/null || true
+        chmod 0640 "$target_path"
+        setfacl -m "u:${r_user}:${file_acl}" "$target_path"
     fi
 }
 
 enforce_all_perms() {
     local r_user="$1"
-    local user_home
+    local r_group user_home
+    r_group="$(id -gn "$r_user")"
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+    ensure_acl_tool
     pc_ensure_config_exists
 
     local dump
-    dump="$(python3 - "$PC_CONFIG_FILE" << 'PYEOF'
+    dump="$(python3 - "$PC_CONFIG_FILE" "$r_user" "$r_group" << 'PYEOF'
 import json, sys
 cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+def_owner, def_group = sys.argv[2], sys.argv[3]
 perms = cfg.get("permissions", {})
 presets = perms.get("presets", {})
 print("PRESET|lock_dotfiles|" + ("1" if presets.get("lock_dotfiles") else "0"))
@@ -2098,39 +2184,64 @@ print("PRESET|noexec_user_dirs|" + ("1" if presets.get("noexec_user_dirs") else 
 for r in perms.get("custom_rules", []):
     p_val = r.get("path", "")
     r_val = r.get("perms", "R-X")
-    print(f"RULE|{p_val}|{r_val}")
+    o_own = r.get("orig_owner", def_owner)
+    o_grp = r.get("orig_group", def_group)
+    o_mod = r.get("orig_mode", "")
+    print(f"RULE|{p_val}|{r_val}|{o_own}|{o_grp}|{o_mod}")
 PYEOF
 )"
 
     local lock_dot="0" restrict_extra="0" noexec_dirs="0"
-    while IFS='|' read -r kind a b; do
+    while IFS='|' read -r kind a b c d e; do
         if [[ "$kind" == "PRESET" ]]; then
             [[ "$a" == "lock_dotfiles" ]] && lock_dot="$b"
             [[ "$a" == "restrict_extra_home_dirs" ]] && restrict_extra="$b"
             [[ "$a" == "noexec_user_dirs" ]] && noexec_dirs="$b"
         elif [[ "$kind" == "RULE" && -n "$a" ]]; then
-            apply_single_acl_rule "$r_user" "$a" "$b"
+            apply_single_acl_rule "$r_user" "$a" "$b" "$c" "$d" "$e"
         fi
     done <<< "$dump"
 
-    for df in ".bashrc" ".profile" ".bash_aliases" ".zshrc"; do
+    # Preset 1: Protect shell dotfiles
+    for df in ".bashrc" ".profile" ".bash_aliases" ".zshrc" ".xsessionrc"; do
         local fpath="${user_home}/${df}"
         if [[ -f "$fpath" ]]; then
             if [[ "$lock_dot" == "1" ]]; then
                 chown root:root "$fpath"
                 chmod 0644 "$fpath"
             else
-                chown "${r_user}:$(id -gn "$r_user")" "$fpath"
+                chown "${r_user}:${r_group}" "$fpath"
             fi
         fi
     done
 
-    if [[ "$noexec_dirs" == "1" ]]; then
-        for d in "${user_home}/Downloads" "${user_home}/Desktop" "/tmp"; do
-            [[ -d "$d" ]] && setfacl -R -m "u:${r_user}:rw-" "$d" 2>/dev/null || true
-            [[ -d "$d" ]] && setfacl -m "u:${r_user}:rwx" "$d" 2>/dev/null || true
+    # Preset 2: Restrict access to other users' home directories
+    if [[ -d /home ]]; then
+        for hdir in /home/*; do
+            [[ -d "$hdir" ]] || continue
+            local howner
+            howner="$(stat -c '%U' "$hdir" 2>/dev/null || true)"
+            if [[ -n "$howner" && "$howner" != "$r_user" && "$howner" != "root" && "$howner" != "$PC_ADMIN_USER" ]]; then
+                if [[ "$restrict_extra" == "1" ]]; then
+                    chmod 0750 "$hdir" 2>/dev/null || true
+                    setfacl -m "u:${r_user}:---" "$hdir" 2>/dev/null || true
+                else
+                    setfacl -x "u:${r_user}" "$hdir" 2>/dev/null || true
+                fi
+            fi
         done
     fi
+
+    # Preset 3: Block running executables from Downloads & Desktop
+    for d in "${user_home}/Downloads" "${user_home}/Desktop"; do
+        [[ -d "$d" ]] || continue
+        if [[ "$noexec_dirs" == "1" ]]; then
+            find "$d" -type f -exec chmod a-x {} + 2>/dev/null || true
+            setfacl -m "d:m::rw-" "$d" 2>/dev/null || true
+        else
+            setfacl -x "d:m" "$d" 2>/dev/null || true
+        fi
+    done
 }
 
 build_perms_state_json() {
@@ -2156,14 +2267,15 @@ PYEOF
 handle_set() {
     [[ -z "$TARGET_PATH" ]] && { pc_emit_error "Missing --path <directory>." 2; exit 2; }
 
-    local r_user user_home resolved_path
+    local r_user r_group user_home resolved_path
     r_user="$(get_restricted_user)"
+    r_group="$(id -gn "$r_user")"
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
 
     local rc=0
     resolved_path="$(resolve_safe_user_path "$TARGET_PATH" "$user_home")" || rc=$?
     if [[ "$rc" -eq 2 ]]; then
-        pc_emit_error "Refusing to modify protected system directory: '${TARGET_PATH}'" 2
+        pc_emit_error "Refusing to modify protected system or top-level home directory: '${TARGET_PATH}'" 2
         exit 2
     elif [[ "$rc" -ne 0 || ! -e "$resolved_path" ]]; then
         pc_emit_error "Target path does not exist: '${resolved_path:-$TARGET_PATH}'" 2
@@ -2174,33 +2286,62 @@ handle_set() {
     norm_info="$(normalize_rwx_and_label "$TARGET_MODE" "$TARGET_PERMS" "$resolved_path")"
     IFS='|' read -r rwx_val mode_label <<< "$norm_info"
 
+    local cur_owner cur_group cur_mode
+    cur_owner="$(stat -c '%U' "$resolved_path")"
+    cur_group="$(stat -c '%G' "$resolved_path")"
+    cur_mode="$(stat -c '%a' "$resolved_path")"
+
     pc_init_transaction
     pc_backup_file "$PC_CONFIG_FILE"
 
-    local tmp_cfg
+    local tmp_cfg saved_meta
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
 
-    python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$tmp_cfg" << 'PYEOF'
+    saved_meta="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$cur_owner" "$cur_group" "$cur_mode" "$r_user" "$r_group" "$tmp_cfg" << 'PYEOF'
 import json, sys
 
-cfg_path, path_val, rwx_str, label_str, out_path = sys.argv[1:6]
+cfg_path, path_val, rwx_str, label_str, cur_own, cur_grp, cur_mod, def_own, def_grp, out_path = sys.argv[1:11]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
 perms = data.setdefault("permissions", {"presets": {}, "custom_rules": []})
+
+existing = next((r for r in perms.get("custom_rules", []) if r.get("path") == path_val), None)
+if existing and existing.get("orig_owner"):
+    orig_owner = existing["orig_owner"]
+    orig_group = existing.get("orig_group", def_grp)
+    orig_mode = existing.get("orig_mode", cur_mod)
+else:
+    orig_owner = def_own if cur_own == "root" and path_val.startswith(f"/home/{def_own}/") else cur_own
+    orig_group = def_grp if cur_own == "root" and path_val.startswith(f"/home/{def_own}/") else cur_grp
+    orig_mode = cur_mod
+
 rules = [r for r in perms.get("custom_rules", []) if r.get("path") != path_val]
-rules.append({"path": path_val, "perms": rwx_str, "label": label_str})
+rules.append({
+    "path": path_val,
+    "perms": rwx_str,
+    "label": label_str,
+    "orig_owner": orig_owner,
+    "orig_group": orig_group,
+    "orig_mode": orig_mode
+})
 rules.sort(key=lambda x: x.get("path", ""))
 perms["custom_rules"] = rules
 
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
+
+print(f"{orig_owner}|{orig_group}|{orig_mode}")
 PYEOF
+)"
+
+    local orig_owner orig_group orig_mode
+    IFS='|' read -r orig_owner orig_group orig_mode <<< "$saved_meta"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
     mv "$tmp_cfg" "$PC_CONFIG_FILE"
 
-    apply_single_acl_rule "$r_user" "$resolved_path" "$rwx_val"
+    apply_single_acl_rule "$r_user" "$resolved_path" "$rwx_val" "$orig_owner" "$orig_group" "$orig_mode"
     pc_commit_transaction
 
     pc_emit_result "Set permissions on '${resolved_path}' to ${mode_label} (${rwx_val})" "$(build_perms_state_json)"
@@ -2209,30 +2350,38 @@ PYEOF
 handle_remove() {
     [[ -z "$TARGET_PATH" ]] && { pc_emit_error "Missing --path <directory>." 2; exit 2; }
 
-    local r_user user_home resolved_path
+    local r_user r_group user_home resolved_path
     r_user="$(get_restricted_user)"
+    r_group="$(id -gn "$r_user")"
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
     resolved_path="$(resolve_safe_user_path "$TARGET_PATH" "$user_home" 2>/dev/null || printf '%s' "$TARGET_PATH")"
 
     pc_init_transaction
     pc_backup_file "$PC_CONFIG_FILE"
 
-    local tmp_cfg removed
+    local tmp_cfg removed_info
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
-    removed="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg" << 'PYEOF'
+    removed_info="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$r_user" "$r_group" "$tmp_cfg" << 'PYEOF'
 import json, sys
-cfg_path, p_val, out_path = sys.argv[1:4]
+cfg_path, p_val, def_own, def_grp, out_path = sys.argv[1:6]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
 perms = data.setdefault("permissions", {"presets": {}, "custom_rules": []})
 old = perms.get("custom_rules", [])
+match = next((r for r in old if r.get("path") == p_val), None)
 new = [r for r in old if r.get("path") != p_val]
 perms["custom_rules"] = new
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-print("1" if len(new) != len(old) else "0")
+if match:
+    print(f"1|{match.get('orig_owner', def_own)}|{match.get('orig_group', def_grp)}|{match.get('orig_mode', '')}")
+else:
+    print("0|||")
 PYEOF
 )"
+
+    local removed orig_owner orig_group orig_mode
+    IFS='|' read -r removed orig_owner orig_group orig_mode <<< "$removed_info"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
@@ -2245,12 +2394,17 @@ PYEOF
     fi
 
     if [[ -e "$resolved_path" ]]; then
-        setfacl -R -x "u:${r_user}" "$resolved_path" 2>/dev/null || true
-        setfacl -R -x "d:u:${r_user}" "$resolved_path" 2>/dev/null || true
+        ensure_acl_tool
+        setfacl -R -b "$resolved_path" 2>/dev/null || true
+        chown -R "${orig_owner:-$r_user}:${orig_group:-$r_group}" "$resolved_path"
+        if [[ -n "$orig_mode" ]]; then
+            chmod "$orig_mode" "$resolved_path" 2>/dev/null || true
+        fi
+        chmod -R u+rwX "$resolved_path" 2>/dev/null || true
     fi
 
     pc_commit_transaction
-    pc_emit_result "Removed permission rule for '${resolved_path}'" "$(build_perms_state_json)"
+    pc_emit_result "Removed permission rule and restored access for '${resolved_path}'" "$(build_perms_state_json)"
 }
 
 handle_preset() {

@@ -477,34 +477,40 @@ class ParentControlApp(Gtk.Window):
 
         self.notebook.append_page(box, Gtk.Label(label='Permissions (RWX)'))
 
-    def _load_permissions(self):
+def _load_permissions(self):
         self._loading = True
         try:
             payload = self._backend_command('perms', '--action', 'list').get('data', {})
             self.default_browse_dir = payload.get('default_browse_dir', '/home')
-            
+
             # Presets
             presets = payload.get('presets', {})
             for p_name, chk in self.rwx_presets.items():
                 chk.set_active(presets.get(p_name, False))
-                
+
             # Custom Rules
             self.rwx_store.clear()
             for rule in payload.get('custom_rules', []):
                 path = rule.get('path')
                 perms = rule.get('perms', '---')
-                self.rwx_store.append([path, f'[{perms}] {path}'])
+                label = rule.get('label', '')
+                display = f'[{perms}] {label} — {path}' if label else f'[{perms}] {path}'
+                self.rwx_store.append([path, display])
         except Exception as exc:
             logging.exception('Perms Load Error: %s', exc)
         finally:
             self._loading = False
 
     def _toggle_rwx_preset(self, chk, preset_name):
-        if self._loading: return
+        if self._loading:
+            return
         state = 'true' if chk.get_active() else 'false'
         try:
             self._backend_command('perms', '--action', 'preset', '--name', preset_name, '--enabled', state)
         except Exception as exc:
+            self._loading = True
+            chk.set_active(not chk.get_active())
+            self._loading = False
             self._show_msg(Gtk.MessageType.ERROR, 'Preset Error', str(exc))
 
     def _browse_directory(self, widget):
@@ -514,7 +520,7 @@ class ParentControlApp(Gtk.Window):
         dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
         if hasattr(self, 'default_browse_dir') and os.path.isdir(self.default_browse_dir):
             dialog.set_current_folder(self.default_browse_dir)
-            
+
         if dialog.run() == Gtk.ResponseType.OK:
             self.dir_entry.set_text(dialog.get_filename())
         dialog.destroy()
@@ -522,13 +528,18 @@ class ParentControlApp(Gtk.Window):
     def _apply_rwx(self, widget):
         target = self.dir_entry.get_text().strip()
         mode_idx = self.mode_combo.get_active()
-        if not target or mode_idx < 0: return
+        if not target:
+            self._show_msg(Gtk.MessageType.WARNING, 'Missing Folder', 'Please enter or browse for a target folder path first.')
+            return
+        if mode_idx < 0:
+            return
         try:
             self._backend_command('perms', '--action', 'set', '--path', target, '--mode', self.modes[mode_idx])
             self.dir_entry.set_text('')
             self._load_permissions()
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Permissions Error', str(exc))
+
 
     def _remove_rwx_rule(self, widget):
         selection = self.rwx_tree.get_selection()
