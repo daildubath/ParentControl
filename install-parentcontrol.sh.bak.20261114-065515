@@ -1,0 +1,5440 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Automated Bootstrap & Core Library Installer (Sub-Chunk 1.1)
+# File: install-parentcontrol.sh
+#
+# Description:
+#   Automatically provisions the ParentControl directory structure, deploys
+#   lib/defaults.conf and lib/common.sh, sets strict root permissions, and
+#   verifies the core environment on any Linux Mint 22.3 machine.
+# ==============================================================================
+
+set -Eeuo pipefail
+
+readonly INSTALLER_VERSION="0.1.0"
+VERBOSE=0
+FORCE_OS=0
+SKIP_TEST=0
+
+# ------------------------------------------------------------------------------
+# Help & CLI Tag Parsing
+# ------------------------------------------------------------------------------
+show_help() {
+    cat <<EOF
+ParentControl Bootstrap Installer v${INSTALLER_VERSION}
+
+Description:
+  Creates the ParentControl system directories, deploys core configuration
+  and shared Bash libraries (defaults.conf, common.sh), applies strict file
+  permissions, and runs an automated environment self-test.
+
+Usage:
+  sudo bash install-parentcontrol.sh [OPTIONS]
+
+Tags / Options:
+  -v, --verbose     Enable detailed step-by-step progress output
+      --force-os    Bypass strict Linux Mint 22.3 OS version validation
+      --skip-test   Skip the automated post-install self-test
+  -h, --help        Show this help message and exit
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --force-os)
+                FORCE_OS=1
+                shift
+                ;;
+            --skip-test)
+                SKIP_TEST=1
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                printf '[ERROR] Unknown option: %s\n\n' "$1" >&2
+                show_help >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+log_step() {
+    local msg="$1"
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        printf '[INFO] %s\n' "$msg"
+    fi
+}
+
+on_install_error() {
+    local exit_code="$1"
+    local line_no="$2"
+    local failed_cmd="$3"
+    printf '[ERROR] Bootstrap failed at line %s (exit code %s): %s\n' \
+        "$line_no" "$exit_code" "$failed_cmd" >&2
+    exit "$exit_code"
+}
+
+trap 'on_install_error $? $LINENO "$BASH_COMMAND"' ERR
+
+# ------------------------------------------------------------------------------
+# Pre-flight Environment Checks
+# ------------------------------------------------------------------------------
+preflight_checks() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        printf '[ERROR] This installer must be run as root (use sudo).\n' >&2
+        exit 3
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '[ERROR] python3 is required but not installed.\n' >&2
+        exit 1
+    fi
+
+    if [[ "$FORCE_OS" -eq 0 ]]; then
+        if [[ ! -r /etc/os-release ]]; then
+            printf '[ERROR] Unable to read /etc/os-release.\n' >&2
+            exit 4
+        fi
+        local os_id="" os_version=""
+        # shellcheck disable=SC1091
+        os_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+        # shellcheck disable=SC1091
+        os_version="$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")"
+
+        if [[ "$os_id" != "linuxmint" || "$os_version" != "22.3" ]]; then
+            printf '[ERROR] Detected %s %s. Target OS is Linux Mint 22.3 (use --force-os to override).\n' \
+                "$os_id" "$os_version" >&2
+            exit 4
+        fi
+    fi
+
+    log_step "Pre-flight checks passed."
+}
+
+# ------------------------------------------------------------------------------
+# Directory Provisioning
+# ------------------------------------------------------------------------------
+create_directories() {
+    log_step "Creating ParentControl directory structure..."
+
+    install -d -m 0755 -o root -g root /opt/parentcontrol
+    install -d -m 0755 -o root -g root /opt/parentcontrol/bin
+    install -d -m 0755 -o root -g root /opt/parentcontrol/lib
+
+    install -d -m 0750 -o root -g root /etc/parentcontrol
+    install -d -m 0750 -o root -g root /var/lib/parentcontrol
+    install -d -m 0700 -o root -g root /var/lib/parentcontrol/backup
+    install -d -m 0751 -o root -g root /var/lib/parentcontrol/queue
+    install -d -m 1733 -o root -g root /var/lib/parentcontrol/queue/pending
+    install -d -m 0750 -o root -g root /var/lib/parentcontrol/queue/approved
+    install -d -m 0750 -o root -g root /var/lib/parentcontrol/queue/archive
+
+    mkdir -p /opt/parentcontrol /opt/parentcontrol/bin /opt/parentcontrol/lib /opt/parentcontrol/gui
+    chown -R root:root /opt/parentcontrol
+    chmod 0755 /opt/parentcontrol /opt/parentcontrol/bin /opt/parentcontrol/lib /opt/parentcontrol/gui
+
+    mkdir -p /var/spool/parentcontrol
+    chown root:root /var/spool/parentcontrol
+    chmod 0755 /var/spool/parentcontrol
+
+    mkdir -p /var/spool/parentcontrol/requests
+    chown root:root /var/spool/parentcontrol/requests
+    chmod 1777 /var/spool/parentcontrol/requests
+
+    install -d -m 0750 -o root -g root /var/log/parentcontrol
+
+    log_step "Directories created and permissions applied."
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/lib/defaults.conf
+# ------------------------------------------------------------------------------
+deploy_defaults_conf() {
+    log_step "Writing /opt/parentcontrol/lib/defaults.conf..."
+
+    cat << 'DEFAULTS_CONF_EOF' > /opt/parentcontrol/lib/defaults.conf
+# ==============================================================================
+# ParentControl - Default Constants & System Configuration
+# File: /opt/parentcontrol/lib/defaults.conf
+# ==============================================================================
+
+# Core filesystem paths
+readonly PC_VERSION="0.1.0"
+readonly PC_BASE_DIR="/opt/parentcontrol"
+readonly PC_BIN_DIR="/opt/parentcontrol/bin"
+readonly PC_LIB_DIR="/opt/parentcontrol/lib"
+readonly PC_ETC_DIR="/etc/parentcontrol"
+readonly PC_CONFIG_FILE="/etc/parentcontrol/config.json"
+readonly PC_VAR_DIR="/var/lib/parentcontrol"
+readonly PC_BACKUP_DIR="/var/lib/parentcontrol/backup"
+readonly PC_QUEUE_DIR="/var/lib/parentcontrol/queue"
+readonly PC_LOG_DIR="/var/log/parentcontrol"
+readonly PC_LOG_FILE="/var/log/parentcontrol/parentcontrol.log"
+
+# Privilege & PolicyKit settings
+readonly PC_ADMIN_USER="pcadmin"
+readonly PC_ACCOUNTS_SERVICE_DIR="/var/lib/AccountsService/users"
+readonly PC_POLKIT_RULE="/etc/polkit-1/rules.d/50-parentcontrol.rules"
+
+# Managed /etc/hosts markers for ACL enforcement
+readonly PC_HOSTS_FILE="/etc/hosts"
+readonly PC_HOSTS_BEGIN_MARKER="# BEGIN PARENTCONTROL MANAGED BLOCK - DO NOT EDIT"
+readonly PC_HOSTS_END_MARKER="# END PARENTCONTROL MANAGED BLOCK"
+
+# Standard Linux Mint user directories allowed by default
+readonly PC_STANDARD_HOME_DIRS=(
+    "Desktop"
+    "Documents"
+    "Downloads"
+    "Music"
+    "Pictures"
+    "Public"
+    "Templates"
+    "Videos"
+)
+
+# Common non-essential Linux Mint 22.3 packages offered for removal in setup
+readonly PC_DEFAULT_BLOAT_APPS=(
+    "transmission-gtk"
+    "warpinator"
+    "hypnotix"
+    "hexchat"
+    "thunderbird"
+    "thingy"
+    "celluloid"
+    "rhythmbox"
+)
+
+# Default web blocklist feed (Pi-hole / hosts compatible)
+readonly PC_DEFAULT_BLOCKLIST_FEEDS=(
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+)
+DEFAULTS_CONF_EOF
+
+    chown root:root /opt/parentcontrol/lib/defaults.conf
+    chmod 0644 /opt/parentcontrol/lib/defaults.conf
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/lib/common.sh
+# ------------------------------------------------------------------------------
+deploy_common_sh() {
+    log_step "Writing /opt/parentcontrol/lib/common.sh..."
+
+    cat << 'COMMON_SH_EOF' > /opt/parentcontrol/lib/common.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Shared Core Library
+# File: /opt/parentcontrol/lib/common.sh
+#
+# Provides:
+#   - Strict error handling & automatic transactional file rollback
+#   - Structured single-line audit logging readable by the Python GUI
+#   - Standardized CLI flag parsing (--verbose, --json, --help)
+#   - Safe JSON state read/write helpers via Python 3
+#   - OS & privilege validation helpers
+#
+# GUI HANDOFF:
+#   All ParentControl scripts emit JSON to stdout when --json is passed:
+#     Success: {"status":"ok","module":"<name>","action":"<verb>","message":"<text>","data":{...}}
+#     Failure: {"status":"error","module":"<name>","action":"<verb>","message":"<text>","code":<int>}
+#   Standard Exit Codes:
+#     0 = Success
+#     1 = Runtime / execution failure (rollback triggered if applicable)
+#     2 = Invalid CLI flags or missing required parameters
+#     3 = Root / PolicyKit privilege required
+#     4 = Unsupported OS environment
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/defaults.conf
+source "/opt/parentcontrol/lib/defaults.conf"
+
+# Runtime state flags (modifiable via CLI tags)
+PC_VERBOSE=0
+PC_JSON_OUTPUT=0
+PC_FORCE_OS=0
+PC_REMAINING_ARGS=()
+
+# Module metadata defaults (overridden by each calling script)
+PC_MODULE_NAME="${PC_MODULE_NAME:-core}"
+PC_CURRENT_ACTION="${PC_CURRENT_ACTION:-init}"
+PC_SCRIPT_DESC="${PC_SCRIPT_DESC:-ParentControl system management module.}"
+PC_SCRIPT_USAGE="${PC_SCRIPT_USAGE:-$(basename "$0") [OPTIONS]}"
+PC_SCRIPT_FLAGS="${PC_SCRIPT_FLAGS:-}"
+
+# Transactional rollback state
+PC_TX_ACTIVE=0
+PC_TX_DIR=""
+PC_TX_MANIFEST=()
+
+# ------------------------------------------------------------------------------
+# Logging Subsystem
+# ------------------------------------------------------------------------------
+pc_log() {
+    local level="$1"
+    local message="$2"
+    local timestamp clean_msg
+
+    timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    clean_msg="$(printf '%s' "$message" | tr '\n' ' ' | sed 's/|/\//g')"
+
+    if [[ "${EUID}" -eq 0 ]]; then
+        if [[ ! -d "$PC_LOG_DIR" ]]; then
+            mkdir -p "$PC_LOG_DIR"
+            chmod 0750 "$PC_LOG_DIR"
+        fi
+        if [[ ! -f "$PC_LOG_FILE" ]]; then
+            touch "$PC_LOG_FILE"
+            chmod 0640 "$PC_LOG_FILE"
+            chown root:root "$PC_LOG_FILE"
+        fi
+        printf '%s | %-5s | %-12s | %s\n' \
+            "$timestamp" "$level" "$PC_MODULE_NAME" "$clean_msg" >> "$PC_LOG_FILE"
+    fi
+
+    if [[ "$PC_VERBOSE" -eq 1 || "$level" == "ERROR" ]]; then
+        printf '[%s] [%s] [%s] %s\n' \
+            "$timestamp" "$level" "$PC_MODULE_NAME" "$clean_msg" >&2
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Standardized Output & GUI Handoff Formatting
+# ------------------------------------------------------------------------------
+pc_emit_result() {
+    local message="$1"
+    local data_json="${2:-"{}"}"
+
+    pc_log "INFO" "$message"
+
+    if [[ "$PC_JSON_OUTPUT" -eq 1 ]]; then
+        python3 -c '
+import json, sys
+payload = {
+    "status": "ok",
+    "module": sys.argv[1],
+    "action": sys.argv[2],
+    "message": sys.argv[3],
+    "data": json.loads(sys.argv[4])
+}
+print(json.dumps(payload))
+' "$PC_MODULE_NAME" "$PC_CURRENT_ACTION" "$message" "$data_json"
+    else
+        printf '[OK] %s\n' "$message"
+    fi
+}
+
+pc_emit_error() {
+    local message="$1"
+    local exit_code="${2:-1}"
+
+    pc_log "ERROR" "$message"
+
+    if [[ "$PC_JSON_OUTPUT" -eq 1 ]]; then
+        python3 -c '
+import json, sys
+payload = {
+    "status": "error",
+    "module": sys.argv[1],
+    "action": sys.argv[2],
+    "message": sys.argv[3],
+    "code": int(sys.argv[4])
+}
+print(json.dumps(payload))
+' "$PC_MODULE_NAME" "$PC_CURRENT_ACTION" "$message" "$exit_code"
+    else
+        printf '[ERROR] %s\n' "$message" >&2
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Transactional Backup & Automatic Rollback Engine
+# ------------------------------------------------------------------------------
+pc_init_transaction() {
+    local tx_id
+    tx_id="$(date -u +"%Y%m%dT%H%M%SZ")_$$"
+    PC_TX_DIR="${PC_BACKUP_DIR}/${tx_id}"
+    mkdir -p "$PC_TX_DIR"
+    chmod 0700 "$PC_TX_DIR"
+    PC_TX_MANIFEST=()
+    PC_TX_ACTIVE=1
+    pc_log "DEBUG" "Initialized transaction backup directory: $PC_TX_DIR"
+}
+
+pc_backup_file() {
+    local target_file="$1"
+
+    if [[ "$PC_TX_ACTIVE" -ne 1 ]]; then
+        pc_init_transaction
+    fi
+
+    if [[ -e "$target_file" ]]; then
+        local safe_name backup_path
+        safe_name="$(printf '%s' "$target_file" | tr '/' '_')"
+        backup_path="${PC_TX_DIR}/${safe_name}.bak"
+        cp -a "$target_file" "$backup_path"
+        PC_TX_MANIFEST+=("MODIFIED|${target_file}|${backup_path}")
+        pc_log "DEBUG" "Backed up existing file: $target_file -> $backup_path"
+    else
+        PC_TX_MANIFEST+=("CREATED|${target_file}|")
+        pc_log "DEBUG" "Registered new file for rollback tracking: $target_file"
+    fi
+}
+
+pc_commit_transaction() {
+    if [[ "$PC_TX_ACTIVE" -eq 1 && -n "$PC_TX_DIR" && -d "$PC_TX_DIR" ]]; then
+        rm -rf "$PC_TX_DIR"
+        pc_log "DEBUG" "Committed transaction and cleaned up backup: $PC_TX_DIR"
+    fi
+    PC_TX_ACTIVE=0
+    PC_TX_MANIFEST=()
+    PC_TX_DIR=""
+}
+
+pc_rollback() {
+    trap - ERR
+
+    if [[ "$PC_TX_ACTIVE" -ne 1 || "${#PC_TX_MANIFEST[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    pc_log "WARN" "Rolling back ${#PC_TX_MANIFEST[@]} file change(s)..."
+
+    local idx entry state orig_path backup_path
+    for (( idx=${#PC_TX_MANIFEST[@]}-1; idx>=0; idx-- )); do
+        entry="${PC_TX_MANIFEST[$idx]}"
+        IFS='|' read -r state orig_path backup_path <<< "$entry"
+
+        if [[ "$state" == "MODIFIED" && -e "$backup_path" ]]; then
+            cp -a "$backup_path" "$orig_path"
+            pc_log "INFO" "Restored original file: $orig_path"
+        elif [[ "$state" == "CREATED" && -e "$orig_path" ]]; then
+            rm -rf "$orig_path"
+            pc_log "INFO" "Removed incomplete newly created file: $orig_path"
+        fi
+    done
+
+    [[ -n "$PC_TX_DIR" && -d "$PC_TX_DIR" ]] && rm -rf "$PC_TX_DIR"
+    PC_TX_ACTIVE=0
+    PC_TX_MANIFEST=()
+}
+
+pc_on_error() {
+    local exit_code="$1"
+    local line_no="$2"
+    local failed_cmd="$3"
+
+    pc_rollback
+    pc_emit_error "Command '${failed_cmd}' failed at line ${line_no} (exit code ${exit_code}). Changes rolled back." "$exit_code"
+    exit "$exit_code"
+}
+
+trap 'pc_on_error $? $LINENO "$BASH_COMMAND"' ERR
+
+# ------------------------------------------------------------------------------
+# CLI Flag & Help Handling
+# ------------------------------------------------------------------------------
+pc_print_help() {
+    cat <<EOF
+ParentControl v${PC_VERSION} - Module: ${PC_MODULE_NAME}
+
+Description:
+  ${PC_SCRIPT_DESC}
+
+Usage:
+  ${PC_SCRIPT_USAGE}
+
+Standard Flags:
+  -v, --verbose       Enable detailed diagnostic output to stderr
+      --json          Emit structured JSON output for GUI integration
+      --force-os      Bypass strict Linux Mint 22.3 version check
+  -h, --help          Display this help message and exit
+${PC_SCRIPT_FLAGS:+
+Module Flags:
+${PC_SCRIPT_FLAGS}}
+EOF
+}
+
+pc_parse_common_flags() {
+    PC_REMAINING_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose)
+                PC_VERBOSE=1
+                shift
+                ;;
+            --json)
+                PC_JSON_OUTPUT=1
+                shift
+                ;;
+            --force-os)
+                PC_FORCE_OS=1
+                shift
+                ;;
+            -h|--help)
+                pc_print_help
+                exit 0
+                ;;
+            *)
+                PC_REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Environment & Privilege Guards
+# ------------------------------------------------------------------------------
+pc_require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        pc_emit_error "Root privileges are required (run via pkexec or sudo)." 3
+        exit 3
+    fi
+}
+
+pc_verify_mint() {
+    if [[ "$PC_FORCE_OS" -eq 1 ]]; then
+        pc_log "WARN" "Bypassing OS verification due to --force-os flag."
+        return 0
+    fi
+
+    if [[ ! -r /etc/os-release ]]; then
+        pc_emit_error "Cannot read /etc/os-release to verify operating system." 4
+        exit 4
+    fi
+
+    local os_id="" os_version=""
+    # shellcheck disable=SC1091
+    os_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+    # shellcheck disable=SC1091
+    os_version="$(. /etc/os-release && printf '%s' "${VERSION_ID:-}")"
+
+    if [[ "$os_id" != "linuxmint" || "$os_version" != "22.3" ]]; then
+        pc_emit_error "Unsupported OS (${os_id} ${os_version}). ParentControl targets Linux Mint 22.3." 4
+        exit 4
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Safe JSON Configuration Helpers (Python 3 backed)
+# ------------------------------------------------------------------------------
+pc_ensure_config_exists() {
+    if [[ ! -f "$PC_CONFIG_FILE" ]]; then
+        mkdir -p "$PC_ETC_DIR"
+        chmod 0750 "$PC_ETC_DIR"
+        cat <<EOF > "$PC_CONFIG_FILE"
+{
+  "version": "${PC_VERSION}",
+  "restricted_user": "",
+  "admin_user": "${PC_ADMIN_USER}",
+  "browser": "firefox",
+  "acl": {
+    "feeds": [
+      "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+    ],
+    "blacklist": [],
+    "whitelist": []
+  },
+  "permissions": {
+    "lock_dotfiles": false,
+    "restrict_extra_home_dirs": false,
+    "noexec_user_dirs": false
+  },
+  "ports": {
+    "blocked": []
+  },
+  "devices": {
+    "usb_storage_blocked": false,
+    "webcam_blocked": false,
+    "mic_blocked": false,
+    "bluetooth_blocked": false
+  },
+  "maintenance": {
+    "auto_updates": true,
+    "auto_snapshots": true,
+    "trash_retention_days": 7,
+    "senior_accessibility": false
+  }
+}
+EOF
+        chown root:root "$PC_CONFIG_FILE"
+        chmod 0640 "$PC_CONFIG_FILE"
+        pc_log "INFO" "Initialized default master configuration at $PC_CONFIG_FILE"
+    fi
+}
+
+pc_json_get() {
+    local dot_path="$1"
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+cur = data
+for key in sys.argv[2].split("."):
+    if isinstance(cur, dict) and key in cur:
+        cur = cur[key]
+    else:
+        sys.exit(1)
+
+if isinstance(cur, (dict, list)):
+    print(json.dumps(cur))
+elif isinstance(cur, bool):
+    print("true" if cur else "false")
+else:
+    print(cur)
+' "$PC_CONFIG_FILE" "$dot_path"
+}
+
+pc_json_set() {
+    local dot_path="$1"
+    local raw_json_value="$2"
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_file
+    tmp_file="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, dot_path, raw_val, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+val = json.loads(raw_val)
+keys = dot_path.split(".")
+cur = data
+for k in keys[:-1]:
+    if k not in cur or not isinstance(cur[k], dict):
+        cur[k] = {}
+    cur = cur[k]
+cur[keys[-1]] = val
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$dot_path" "$raw_json_value" "$tmp_file"
+
+    chown root:root "$tmp_file"
+    chmod 0640 "$tmp_file"
+    mv "$tmp_file" "$PC_CONFIG_FILE"
+    pc_log "DEBUG" "Updated config key '${dot_path}'"
+}
+COMMON_SH_EOF
+
+    chown root:root /opt/parentcontrol/lib/common.sh
+    chmod 0644 /opt/parentcontrol/lib/common.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-ctl.sh (Sub-Chunk 1.2)
+# ------------------------------------------------------------------------------
+deploy_pc_ctl_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-ctl.sh..."
+
+    cat << 'PC_CTL_SH_EOF' > /opt/parentcontrol/bin/pc-ctl.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Master CLI Router & Core State/Log Manager
+# File: /opt/parentcontrol/bin/pc-ctl.sh
+#
+# Description:
+#   Primary privileged entry point invoked by the Python GUI (via pkexec) or
+#   an administrator over SSH. Routes module subcommands to /opt/parentcontrol/bin/pc-*.sh
+#   and natively manages master configuration (config.json), audit logs, and
+#   system health status.
+#
+# GUI HANDOFF:
+#   Invoke via PolicyKit:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh <module> --action <verb> [OPTIONS] --json
+#
+#   Built-in Modules:
+#     status --action check --json
+#       -> Returns {"status":"ok","module":"status","action":"check","data":{...}}
+#     config --action get [--key <dot.path>] --json
+#       -> Returns full config.json or specific dot-path key under "data"
+#     config --action set --key <dot.path> --value <val> --json
+#       -> Updates config.json atomically with rollback support
+#     logs   --action read [--lines <N>] [--level <INFO|WARN|ERROR|DEBUG>] --json
+#       -> Returns {"count":N,"entries":[{"timestamp":"...","level":"...","module":"...","message":"..."}]}
+#     logs   --action clear --json
+#       -> Truncates parentcontrol.log and records a fresh admin-clear audit entry
+#
+#   External Sub-Modules (forwarded automatically):
+#     acl | perms | ports | devices | apps | maint | queue | users | ext-bridge
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="ctl"
+PC_CURRENT_ACTION="dispatch"
+PC_SCRIPT_DESC="Master CLI router, configuration manager, and audit log controller for ParentControl."
+PC_SCRIPT_USAGE="pc-ctl.sh <module> --action <verb> [MODULE_OPTIONS] [--json] [--verbose] [--help]"
+PC_SCRIPT_FLAGS="  Built-in Modules & Actions:
+    status   --action check
+    config   --action <get|set> [--key <dot.path>] [--value <value>]
+    logs     --action <read|clear> [--lines <N>] [--level <LEVEL>]
+
+  Routed Modules (run 'pc-ctl.sh <module> --help' for module-specific flags):
+    acl, perms, ports, devices, apps, maint, queue, users, ext-bridge"
+
+# ------------------------------------------------------------------------------
+# Resolve External Module Script Path
+# ------------------------------------------------------------------------------
+resolve_module_script() {
+    local mod="$1"
+    case "$mod" in
+        acl|net-acl)
+            printf '%s/pc-net-acl.sh' "$PC_BIN_DIR"
+            ;;
+        perms|permissions)
+            printf '%s/pc-perms.sh' "$PC_BIN_DIR"
+            ;;
+        ports|firewall)
+            printf '%s/pc-ports.sh' "$PC_BIN_DIR"
+            ;;
+        devices|hardware)
+            printf '%s/pc-devices.sh' "$PC_BIN_DIR"
+            ;;
+        apps|software)
+            printf '%s/pc-apps.sh' "$PC_BIN_DIR"
+            ;;
+        maint|maintenance)
+            printf '%s/pc-maint.sh' "$PC_BIN_DIR"
+            ;;
+        queue|approvals)
+            printf '%s/pc-queue.sh' "$PC_BIN_DIR"
+            ;;
+        users|profiles)
+            printf '%s/pc-users.sh' "$PC_BIN_DIR"
+            ;;
+        ext|ext-bridge|extension)
+            printf '%s/pc-ext-bridge.sh' "$PC_BIN_DIR"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Built-in Module: status
+# ------------------------------------------------------------------------------
+handle_status_module() {
+    PC_MODULE_NAME="status"
+    local action=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                action="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for 'status' module: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    [[ -z "$action" ]] && action="check"
+    PC_CURRENT_ACTION="$action"
+
+    if [[ "$action" != "check" ]]; then
+        pc_emit_error "Unsupported action '${action}' for 'status' (expected: check)." 2
+        exit 2
+    fi
+
+    pc_ensure_config_exists
+
+    local admin_exists="false"
+    if id -u "$PC_ADMIN_USER" >/dev/null 2>&1; then
+        admin_exists="true"
+    fi
+
+    local polkit_exists="false"
+    [[ -f "$PC_POLKIT_RULE" ]] && polkit_exists="true"
+
+    local status_json
+    status_json="$(python3 -c '
+import json, os, sys
+
+cfg_path, bin_dir, log_path, admin_ok, polkit_ok = sys.argv[1:6]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+installed_scripts = sorted(
+    name for name in os.listdir(bin_dir)
+    if name.startswith("pc-") and name.endswith(".sh")
+) if os.path.isdir(bin_dir) else []
+
+log_size = os.path.getsize(log_path) if os.path.isfile(log_path) else 0
+
+print(json.dumps({
+    "version": cfg.get("version", "unknown"),
+    "restricted_user": cfg.get("restricted_user", ""),
+    "admin_user": cfg.get("admin_user", "pcadmin"),
+    "admin_account_ready": admin_ok == "true",
+    "polkit_rule_ready": polkit_ok == "true",
+    "browser": cfg.get("browser", "firefox"),
+    "installed_modules": installed_scripts,
+    "log_size_bytes": log_size
+}))
+' "$PC_CONFIG_FILE" "$PC_BIN_DIR" "$PC_LOG_FILE" "$admin_exists" "$polkit_exists")"
+
+    pc_emit_result "ParentControl status retrieved" "$status_json"
+}
+
+# ------------------------------------------------------------------------------
+# Built-in Module: config
+# ------------------------------------------------------------------------------
+handle_config_module() {
+    PC_MODULE_NAME="config"
+    local action="" key="" raw_value="" has_value=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                action="${2:-}"
+                shift 2
+                ;;
+            --key)
+                key="${2:-}"
+                shift 2
+                ;;
+            --value)
+                raw_value="${2:-}"
+                has_value=1
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for 'config' module: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$action" ]]; then
+        pc_emit_error "Missing required --action <get|set> for 'config' module." 2
+        exit 2
+    fi
+
+    PC_CURRENT_ACTION="$action"
+    pc_ensure_config_exists
+
+    case "$action" in
+        get)
+            if [[ -z "$key" ]]; then
+                local full_cfg
+                full_cfg="$(cat "$PC_CONFIG_FILE")"
+                pc_emit_result "Retrieved full configuration" "$full_cfg"
+            else
+                local val_json
+                if ! val_json="$(python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cur = json.load(f)
+for part in sys.argv[2].split("."):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        sys.exit(1)
+print(json.dumps({"key": sys.argv[2], "value": cur}))
+' "$PC_CONFIG_FILE" "$key")"; then
+                    pc_emit_error "Configuration key not found: '${key}'" 2
+                    exit 2
+                fi
+                pc_emit_result "Retrieved configuration key '${key}'" "$val_json"
+            fi
+            ;;
+        set)
+            if [[ -z "$key" || "$has_value" -ne 1 ]]; then
+                pc_emit_error "Action 'set' requires both --key <dot.path> and --value <val>." 2
+                exit 2
+            fi
+
+            local normalized_json
+            normalized_json="$(python3 -c '
+import json, sys
+raw = sys.argv[1]
+try:
+    parsed = json.loads(raw)
+except Exception:
+    parsed = raw
+print(json.dumps(parsed))
+' "$raw_value")"
+
+            pc_init_transaction
+            pc_json_set "$key" "$normalized_json"
+            pc_commit_transaction
+
+            local updated_payload
+            updated_payload="$(python3 -c '
+import json, sys
+print(json.dumps({"key": sys.argv[1], "value": json.loads(sys.argv[2])}))
+' "$key" "$normalized_json")"
+            pc_emit_result "Updated configuration key '${key}'" "$updated_payload"
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${action}' for 'config' (expected: get, set)." 2
+            exit 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Built-in Module: logs
+# ------------------------------------------------------------------------------
+handle_logs_module() {
+    PC_MODULE_NAME="logs"
+    local action="" max_lines=200 level_filter=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                action="${2:-}"
+                shift 2
+                ;;
+            --lines)
+                max_lines="${2:-}"
+                shift 2
+                ;;
+            --level)
+                level_filter="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for 'logs' module: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$action" ]]; then
+        pc_emit_error "Missing required --action <read|clear> for 'logs' module." 2
+        exit 2
+    fi
+
+    PC_CURRENT_ACTION="$action"
+
+    case "$action" in
+        read)
+            if ! [[ "$max_lines" =~ ^[0-9]+$ ]] || [[ "$max_lines" -le 0 ]]; then
+                pc_emit_error "--lines must be a positive integer (got: '${max_lines}')." 2
+                exit 2
+            fi
+
+            if [[ ! -f "$PC_LOG_FILE" ]]; then
+                pc_emit_result "Audit log is currently empty" '{"count":0,"entries":[]}'
+                return 0
+            fi
+
+            local logs_json
+            logs_json="$(python3 -c '
+import json, sys
+
+log_path = sys.argv[1]
+limit = int(sys.argv[2])
+lvl_filter = sys.argv[3].strip().upper()
+
+entries = []
+with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+    for raw_line in f:
+        line = raw_line.rstrip("\r\n")
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|", 3)]
+        if len(parts) == 4:
+            entry = {
+                "timestamp": parts[0],
+                "level": parts[1],
+                "module": parts[2],
+                "message": parts[3]
+            }
+        else:
+            entry = {
+                "timestamp": "",
+                "level": "INFO",
+                "module": "unknown",
+                "message": line
+            }
+        if lvl_filter and entry["level"].upper() != lvl_filter:
+            continue
+        entries.append(entry)
+
+sliced = entries[-limit:]
+print(json.dumps({"count": len(sliced), "entries": sliced}))
+' "$PC_LOG_FILE" "$max_lines" "$level_filter")"
+
+            pc_emit_result "Retrieved audit log entries" "$logs_json"
+            ;;
+        clear)
+            pc_init_transaction
+            if [[ -f "$PC_LOG_FILE" ]]; then
+                pc_backup_file "$PC_LOG_FILE"
+                : > "$PC_LOG_FILE"
+                chown root:root "$PC_LOG_FILE"
+                chmod 0640 "$PC_LOG_FILE"
+            fi
+            pc_commit_transaction
+            pc_emit_result "Audit log cleared by administrator" '{"cleared":true}'
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${action}' for 'logs' (expected: read, clear)." 2
+            exit 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Main Dispatcher
+# ------------------------------------------------------------------------------
+main() {
+    local leading_flags=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -v|--verbose)
+                PC_VERBOSE=1
+                leading_flags+=("$1")
+                shift
+                ;;
+            --json)
+                PC_JSON_OUTPUT=1
+                leading_flags+=("$1")
+                shift
+                ;;
+            --force-os)
+                PC_FORCE_OS=1
+                leading_flags+=("$1")
+                shift
+                ;;
+            -h|--help)
+                pc_print_help
+                exit 0
+                ;;
+            -*)
+                pc_emit_error "Unknown global flag '${1}'. Specify a module first or run --help." 2
+                exit 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -eq 0 ]]; then
+        pc_emit_error "No module specified. Run 'pc-ctl.sh --help' for usage." 2
+        exit 2
+    fi
+
+    local target_module="$1"
+    shift
+
+    local module_script=""
+    if module_script="$(resolve_module_script "$target_module")"; then
+        if [[ ! -x "$module_script" ]]; then
+            pc_emit_error "Module '${target_module}' (${module_script}) is not installed yet." 1
+            exit 1
+        fi
+        exec "$module_script" "${leading_flags[@]}" "$@"
+    fi
+
+    pc_parse_common_flags "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$target_module" in
+        status)
+            handle_status_module "${PC_REMAINING_ARGS[@]}"
+            ;;
+        config)
+            handle_config_module "${PC_REMAINING_ARGS[@]}"
+            ;;
+        logs)
+            handle_logs_module "${PC_REMAINING_ARGS[@]}"
+            ;;
+        *)
+            pc_emit_error "Unknown module '${target_module}'. Run 'pc-ctl.sh --help' for valid modules." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_CTL_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-ctl.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-ctl.sh
+    if [[ -w /usr/local/bin ]]; then
+        ln -sf /opt/parentcontrol/bin/pc-ctl.sh /usr/local/bin/pc-ctl
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-setup.sh (Sub-Chunk 1.3)
+# ------------------------------------------------------------------------------
+deploy_pc_setup_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-setup.sh..."
+
+    cat << 'PC_SETUP_SH_EOF' > /opt/parentcontrol/bin/pc-setup.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Initial System Provisioner & Privilege Lockdown
+# File: /opt/parentcontrol/bin/pc-setup.sh
+#
+# Description:
+#   Configures the hidden administrator account (pcadmin), deploys PolicyKit
+#   authentication rules for the Python GUI, revokes sudo/adm privileges from
+#   the restricted user account, and records baseline system settings.
+#
+# GUI HANDOFF:
+#   Run once during initial Linux Mint 22.3 setup (interactive or via flags),
+#   or invoke via pkexec when re-provisioning an account:
+#     sudo /opt/parentcontrol/bin/pc-setup.sh --user <username> --admin-pass <pass> --json
+#
+#   Returns JSON when --json is passed:
+#     {"status":"ok","module":"setup","action":"install","message":"...","data":{
+#       "restricted_user":"<user>",
+#       "admin_user":"pcadmin",
+#       "admin_hidden":true,
+#       "polkit_configured":true,
+#       "sudo_revoked":true
+#     }}
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="setup"
+PC_CURRENT_ACTION="install"
+PC_SCRIPT_DESC="Provisions hidden pcadmin user, PolicyKit rules, and revokes restricted user sudo."
+PC_SCRIPT_USAGE="sudo pc-setup.sh [--user <username>] [--admin-pass <password>] [OPTIONS]"
+PC_SCRIPT_FLAGS="      --user <username>       Target restricted Linux Mint user account
+      --admin-pass <pass>     Password for hidden '${PC_ADMIN_USER}' admin account
+      --unattended            Fail instead of prompting if required values are missing
+      --keep-sudo             Keep restricted user in sudo/adm (recommended for VM testing)"
+
+TARGET_USER=""
+ADMIN_PASS=""
+UNATTENDED=0
+KEEP_SUDO=0
+
+# ------------------------------------------------------------------------------
+# Parse Setup Flags
+# ------------------------------------------------------------------------------
+parse_setup_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user)
+                TARGET_USER="${2:-}"
+                shift 2
+                ;;
+            --admin-pass)
+                ADMIN_PASS="${2:-}"
+                shift 2
+                ;;
+            --unattended)
+                UNATTENDED=1
+                shift
+                ;;
+            --keep-sudo)
+                KEEP_SUDO=1
+                shift
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-setup.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Interactive Prompts (when flags are omitted on a TTY)
+# ------------------------------------------------------------------------------
+gather_inputs() {
+    if [[ -z "$TARGET_USER" ]]; then
+        if [[ "$UNATTENDED" -eq 1 || "$PC_JSON_OUTPUT" -eq 1 || ! -t 0 ]]; then
+            pc_emit_error "Missing required --user <username> flag." 2
+            exit 2
+        fi
+        local default_user="${SUDO_USER:-}"
+        if [[ -n "$default_user" && "$default_user" != "root" && "$default_user" != "$PC_ADMIN_USER" ]]; then
+            read -r -p "Enter username to restrict [${default_user}]: " TARGET_USER
+            TARGET_USER="${TARGET_USER:-$default_user}"
+        else
+            read -r -p "Enter username to restrict: " TARGET_USER
+        fi
+    fi
+
+    if [[ -z "$TARGET_USER" ]]; then
+        pc_emit_error "Restricted username cannot be empty." 2
+        exit 2
+    fi
+
+    if [[ "$TARGET_USER" == "root" || "$TARGET_USER" == "$PC_ADMIN_USER" ]]; then
+        pc_emit_error "Cannot restrict system/admin account '${TARGET_USER}'." 2
+        exit 2
+    fi
+
+    if ! id -u "$TARGET_USER" >/dev/null 2>&1; then
+        pc_emit_error "Target user '${TARGET_USER}' does not exist on this system." 2
+        exit 2
+    fi
+
+    if [[ -z "$ADMIN_PASS" ]]; then
+        if [[ "$UNATTENDED" -eq 1 || "$PC_JSON_OUTPUT" -eq 1 || ! -t 0 ]]; then
+            pc_emit_error "Missing required --admin-pass <password> flag." 2
+            exit 2
+        fi
+        local pass_confirm=""
+        while true; do
+            read -r -s -p "Set password for hidden admin '${PC_ADMIN_USER}': " ADMIN_PASS
+            printf '\n' >&2
+            if [[ "${#ADMIN_PASS}" -lt 8 ]]; then
+                printf '[WARN] Password must be at least 8 characters.\n' >&2
+                continue
+            fi
+            read -r -s -p "Confirm password for '${PC_ADMIN_USER}': " pass_confirm
+            printf '\n' >&2
+            if [[ "$ADMIN_PASS" != "$pass_confirm" ]]; then
+                printf '[WARN] Passwords do not match. Try again.\n' >&2
+                continue
+            fi
+            break
+        done
+    fi
+
+    if [[ "${#ADMIN_PASS}" -lt 8 ]]; then
+        pc_emit_error "Admin password must be at least 8 characters long." 2
+        exit 2
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Create & Hide Dedicated Admin User (pcadmin)
+# ------------------------------------------------------------------------------
+provision_admin_account() {
+    pc_log "INFO" "Provisioning hidden admin account '${PC_ADMIN_USER}'..."
+
+    if ! id -u "$PC_ADMIN_USER" >/dev/null 2>&1; then
+        useradd --create-home \
+                --shell /bin/bash \
+                --comment "ParentControl Administrator" \
+                "$PC_ADMIN_USER"
+        pc_log "INFO" "Created local user '${PC_ADMIN_USER}'."
+    else
+        pc_log "INFO" "User '${PC_ADMIN_USER}' already exists; updating credentials and groups."
+    fi
+
+    printf '%s:%s\n' "$PC_ADMIN_USER" "$ADMIN_PASS" | chpasswd
+    usermod -aG sudo "$PC_ADMIN_USER"
+
+    # Verify password hash is active in /etc/shadow before touching restricted user
+    local shadow_entry
+    shadow_entry="$(getent shadow "$PC_ADMIN_USER" | cut -d: -f2)"
+    if [[ -z "$shadow_entry" || "$shadow_entry" == "!"* || "$shadow_entry" == "*"* ]]; then
+        pc_emit_error "Failed to verify active password hash for '${PC_ADMIN_USER}'." 1
+        exit 1
+    fi
+
+    # Hide pcadmin from Linux Mint Slick-Greeter / LightDM login screen
+    mkdir -p "$PC_ACCOUNTS_SERVICE_DIR"
+    local acct_file="${PC_ACCOUNTS_SERVICE_DIR}/${PC_ADMIN_USER}"
+    pc_backup_file "$acct_file"
+
+    cat << 'ACCOUNTS_SERVICE_EOF' > "$acct_file"
+[User]
+SystemAccount=true
+ACCOUNTS_SERVICE_EOF
+
+    chown root:root "$acct_file"
+    chmod 0644 "$acct_file"
+    pc_log "INFO" "Configured AccountsService to hide '${PC_ADMIN_USER}' from login screen."
+}
+
+# ------------------------------------------------------------------------------
+# Deploy PolicyKit Rule for GUI Elevation (pkexec)
+# ------------------------------------------------------------------------------
+deploy_polkit_rule() {
+    pc_log "INFO" "Deploying PolicyKit rule at ${PC_POLKIT_RULE}..."
+
+    mkdir -p "$(dirname "$PC_POLKIT_RULE")"
+    pc_backup_file "$PC_POLKIT_RULE"
+
+    cat << 'POLKIT_RULE_EOF' > "$PC_POLKIT_RULE"
+// ParentControl PolicyKit Authorization Rule
+// Prompts for the hidden 'pcadmin' password whenever the GUI invokes
+// /opt/parentcontrol/bin/pc-* via pkexec, even after the primary user
+// has been removed from the sudo group.
+
+polkit.addAdminRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec") {
+        var prog = action.lookup("program");
+        if (prog && prog.indexOf("/opt/parentcontrol/bin/pc-") === 0) {
+            return ["unix-user:pcadmin"];
+        }
+    }
+    return null;
+});
+
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec") {
+        var prog = action.lookup("program");
+        if (prog && prog.indexOf("/opt/parentcontrol/bin/pc-") === 0) {
+            return polkit.Result.AUTH_ADMIN;
+        }
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+POLKIT_RULE_EOF
+
+    chown root:root "$PC_POLKIT_RULE"
+    chmod 0644 "$PC_POLKIT_RULE"
+}
+
+# ------------------------------------------------------------------------------
+# Revoke Admin Privileges from Restricted User & Lock Directories
+# ------------------------------------------------------------------------------
+lockdown_restricted_user() {
+    local sudo_revoked="false"
+
+    if [[ "$KEEP_SUDO" -eq 1 ]]; then
+        pc_log "WARN" "--keep-sudo specified: leaving '${TARGET_USER}' in sudo/adm groups."
+    else
+        for grp in sudo adm; do
+            if id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx "$grp"; then
+                gpasswd -d "$TARGET_USER" "$grp" >/dev/null
+                pc_log "INFO" "Removed '${TARGET_USER}' from '${grp}' group."
+            fi
+        done
+        sudo_revoked="true"
+    fi
+
+    # Enforce strict root ownership across ParentControl paths
+    chown -R root:root "$PC_BASE_DIR" "$PC_ETC_DIR" "$PC_VAR_DIR" "$PC_LOG_DIR"
+    chmod 0755 "$PC_BASE_DIR" "$PC_BIN_DIR" "$PC_LIB_DIR"
+    chmod 0750 "$PC_ETC_DIR" "$PC_VAR_DIR" "$PC_LOG_DIR"
+    chmod 0640 "$PC_CONFIG_FILE"
+    chmod 1733 "${PC_QUEUE_DIR}/pending"
+
+    local target_json admin_json
+    target_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$TARGET_USER")"
+    admin_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$PC_ADMIN_USER")"
+
+    pc_json_set "restricted_user" "$target_json"
+    pc_json_set "admin_user" "$admin_json"
+
+    printf '%s' "$sudo_revoked"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_setup_args "$@"
+    pc_require_root
+    pc_verify_mint
+    gather_inputs
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    provision_admin_account
+    deploy_polkit_rule
+
+    local sudo_revoked
+    sudo_revoked="$(lockdown_restricted_user)"
+    pc_commit_transaction
+
+    local result_json
+    result_json="$(python3 -c '
+import json, sys
+print(json.dumps({
+    "restricted_user": sys.argv[1],
+    "admin_user": sys.argv[2],
+    "admin_hidden": True,
+    "polkit_configured": True,
+    "sudo_revoked": sys.argv[3] == "true"
+}))
+' "$TARGET_USER" "$PC_ADMIN_USER" "$sudo_revoked")"
+
+    pc_emit_result "ParentControl setup completed for user '${TARGET_USER}'" "$result_json"
+}
+
+main "$@"
+PC_SETUP_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-setup.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-setup.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-net-acl.sh (Sub-Chunk 2.1)
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-net-acl.sh (Sub-Chunks 2.1 & 2.2)
+# ------------------------------------------------------------------------------
+deploy_pc_net_acl_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-net-acl.sh..."
+
+    cat << 'PC_NET_ACL_SH_EOF' > /opt/parentcontrol/bin/pc-net-acl.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Network & Web Access Control List (ACL) Manager
+# File: /opt/parentcontrol/bin/pc-net-acl.sh
+#
+# Description:
+#   Manages custom domain/URL/IP whitelists and blacklists plus Pi-hole/hosts
+#   blocklist feeds in config.json, enforcing them across /etc/hosts, browser
+#   enterprise policies (Firefox, Chromium, Brave), and UFW (for raw IPs).
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh acl --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     add         --list <whitelist|blacklist> --target <url|domain|ip> --json
+#     remove      [--list <whitelist|blacklist>] --target <url|domain|ip> --json
+#     list        --json
+#     apply       --json
+#     sync        [--url <feed_url>] --json
+#     add-feed    --url <feed_url> --json
+#     remove-feed --url <feed_url> --json
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="acl"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages domain/URL/IP ACLs and Pi-hole blocklist feeds across /etc/hosts and browser policies."
+PC_SCRIPT_USAGE="pc-net-acl.sh --action <add|remove|list|apply|sync|add-feed|remove-feed> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         add, remove, list, apply, sync, add-feed, remove-feed
+      --list <type>           Target list for add/remove: whitelist or blacklist
+      --target <url|domain>   Domain, full URL, or IPv4/IPv6 address
+      --url <feed_url>        Hosts/Pi-hole blocklist URL for sync/add-feed/remove-feed"
+
+readonly PC_FEED_CACHE_FILE="${PC_VAR_DIR}/feed-domains.cache"
+
+ACL_ACTION=""
+ACL_LIST=""
+ACL_TARGET=""
+ACL_FEED_URL=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_acl_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                ACL_ACTION="${2:-}"
+                shift 2
+                ;;
+            --list)
+                ACL_LIST="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --target)
+                ACL_TARGET="${2:-}"
+                shift 2
+                ;;
+            --url)
+                ACL_FEED_URL="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-net-acl.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$ACL_ACTION" ]]; then
+        pc_emit_error "Missing required --action <add|remove|list|apply|sync|add-feed|remove-feed>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$ACL_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Normalize & Validate Target (URL, Domain, or IP)
+# Emits "<kind>|<normalized_value>" where kind is "domain" or "ip"
+# ------------------------------------------------------------------------------
+normalize_target() {
+    local raw_input="$1"
+
+    python3 -c '
+import ipaddress, re, sys
+from urllib.parse import urlparse
+
+raw = sys.argv[1].strip()
+if not raw:
+    sys.exit(1)
+
+candidate = raw
+if "://" in candidate:
+    parsed = urlparse(candidate)
+    candidate = parsed.hostname or ""
+else:
+    candidate = candidate.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if candidate.count(":") == 1 and not candidate.startswith("["):
+        candidate = candidate.split(":", 1)[0]
+
+candidate = candidate.strip().strip(".").lower()
+if candidate.startswith("*."):
+    candidate = candidate[2:]
+
+# Normalize www.<domain> to root <domain> (while keeping other subdomains intact)
+if candidate.startswith("www.") and candidate.count(".") >= 2:
+    candidate = candidate[4:]
+
+if not candidate:
+    sys.exit(1)
+
+try:
+    ip_obj = ipaddress.ip_address(candidate)
+    print(f"ip|{ip_obj.compressed}")
+    sys.exit(0)
+except ValueError:
+    pass
+
+if len(candidate) > 253 or "." not in candidate:
+    sys.exit(1)
+
+labels = candidate.split(".")
+label_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+if any(not label_re.match(lbl) for lbl in labels):
+    sys.exit(1)
+
+print(f"domain|{candidate}")
+' "$raw_input"
+}
+
+# ------------------------------------------------------------------------------
+# Enforce Current ACL Rules & Cached Feeds to /etc/hosts, Browsers, and UFW
+# ------------------------------------------------------------------------------
+enforce_acl_rules() {
+    pc_ensure_config_exists
+
+    pc_backup_file "$PC_HOSTS_FILE"
+    pc_backup_file "/etc/firefox/policies/policies.json"
+    pc_backup_file "/etc/chromium/policies/managed/parentcontrol.json"
+    pc_backup_file "/etc/brave/policies/managed/parentcontrol.json"
+
+    mkdir -p /etc/firefox/policies \
+             /etc/chromium/policies/managed \
+             /etc/brave/policies/managed
+
+    local tmp_hosts
+    tmp_hosts="$(mktemp /tmp/pc-hosts.XXXXXX)"
+
+    local ip_actions
+    ip_actions="$(python3 -c '
+import ipaddress, json, os, sys
+
+cfg_path, hosts_path, tmp_hosts_path, feed_cache_path, begin_marker, end_marker = sys.argv[1:7]
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+acl = cfg.get("acl", {})
+whitelist = sorted(set(x.strip().lower() for x in acl.get("whitelist", []) if x.strip()))
+blacklist = sorted(set(x.strip().lower() for x in acl.get("blacklist", []) if x.strip()))
+
+# Expand whitelist with www. variants so whitelisting example.com also unblocks www.example.com
+wl_expanded = set()
+for item in whitelist:
+    wl_expanded.add(item)
+    if not item.startswith("www.") and "." in item:
+        wl_expanded.add(f"www.{item}")
+
+effective_blacklist = [item for item in blacklist if item not in wl_expanded]
+
+def is_ip(val):
+    try:
+        ipaddress.ip_address(val)
+        return True
+    except ValueError:
+        return False
+
+bl_domains = [d for d in effective_blacklist if not is_ip(d)]
+bl_ips = [i for i in effective_blacklist if is_ip(i)]
+
+# 1. Build /etc/hosts managed section (custom blacklist + cached Pi-hole feed domains)
+host_entries = []
+seen_hosts = set()
+
+for dom in bl_domains:
+    variants = [dom]
+    if not dom.startswith("www."):
+        variants.append(f"www.{dom}")
+    for v in variants:
+        if v not in wl_expanded and v not in seen_hosts:
+            seen_hosts.add(v)
+            host_entries.append(f"0.0.0.0 {v}")
+
+if os.path.isfile(feed_cache_path):
+    with open(feed_cache_path, "r", encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            dom = raw_line.strip().lower()
+            if not dom or dom in wl_expanded or dom in seen_hosts:
+                continue
+            seen_hosts.add(dom)
+            host_entries.append(f"0.0.0.0 {dom}")
+
+existing_lines = []
+if os.path.exists(hosts_path):
+    with open(hosts_path, "r", encoding="utf-8", errors="replace") as f:
+        in_block = False
+        for line in f:
+            stripped = line.rstrip("\r\n")
+            if stripped == begin_marker:
+                in_block = True
+                continue
+            if stripped == end_marker:
+                in_block = False
+                continue
+            if not in_block:
+                existing_lines.append(stripped)
+
+while existing_lines and existing_lines[-1] == "":
+    existing_lines.pop()
+
+out_lines = list(existing_lines)
+if host_entries:
+    out_lines.append("")
+    out_lines.append(begin_marker)
+    out_lines.extend(host_entries)
+    out_lines.append(end_marker)
+
+with open(tmp_hosts_path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out_lines) + "\n")
+
+# 2. Update Firefox Enterprise Policy (/etc/firefox/policies/policies.json)
+ff_policy_path = "/etc/firefox/policies/policies.json"
+ff_data = {"policies": {}}
+if os.path.exists(ff_policy_path):
+    try:
+        with open(ff_policy_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                ff_data = loaded
+    except Exception:
+        ff_data = {"policies": {}}
+
+ff_data.setdefault("policies", {})
+if effective_blacklist or whitelist:
+    ff_patterns_block = []
+    for item in effective_blacklist:
+        if is_ip(item):
+            ff_patterns_block.append(f"*://{item}/*")
+        else:
+            ff_patterns_block.append(f"*://*.{item}/*")
+            ff_patterns_block.append(f"*://{item}/*")
+    ff_patterns_allow = []
+    for item in whitelist:
+        if is_ip(item):
+            ff_patterns_allow.append(f"*://{item}/*")
+        else:
+            ff_patterns_allow.append(f"*://*.{item}/*")
+            ff_patterns_allow.append(f"*://{item}/*")
+    ff_data["policies"]["WebsiteFilter"] = {
+        "Block": ff_patterns_block[:1000],
+        "Exceptions": ff_patterns_allow[:1000]
+    }
+else:
+    ff_data["policies"].pop("WebsiteFilter", None)
+
+with open(ff_policy_path, "w", encoding="utf-8") as f:
+    json.dump(ff_data, f, indent=2)
+    f.write("\n")
+
+# 3. Update Chromium & Brave Enterprise Policies
+for chromium_path in (
+    "/etc/chromium/policies/managed/parentcontrol.json",
+    "/etc/brave/policies/managed/parentcontrol.json"
+):
+    c_data = {}
+    if os.path.exists(chromium_path):
+        try:
+            with open(chromium_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    c_data = loaded
+        except Exception:
+            c_data = {}
+
+    if effective_blacklist:
+        c_data["URLBlocklist"] = effective_blacklist
+    else:
+        c_data.pop("URLBlocklist", None)
+
+    if whitelist:
+        c_data["URLAllowlist"] = whitelist
+    else:
+        c_data.pop("URLAllowlist", None)
+
+    with open(chromium_path, "w", encoding="utf-8") as f:
+        json.dump(c_data, f, indent=2)
+        f.write("\n")
+
+print(json.dumps({"blocked_ips": bl_ips, "total_hosts_blocked": len(host_entries)}))
+' "$PC_CONFIG_FILE" "$PC_HOSTS_FILE" "$tmp_hosts" "$PC_FEED_CACHE_FILE" "$PC_HOSTS_BEGIN_MARKER" "$PC_HOSTS_END_MARKER")"
+
+    chown root:root "$tmp_hosts"
+    chmod 0644 "$tmp_hosts"
+    mv "$tmp_hosts" "$PC_HOSTS_FILE"
+
+    chmod 0644 /etc/firefox/policies/policies.json \
+               /etc/chromium/policies/managed/parentcontrol.json \
+               /etc/brave/policies/managed/parentcontrol.json
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        local ip_list
+        ip_list="$(python3 -c 'import json, sys; print("\n".join(json.loads(sys.argv[1]).get("blocked_ips", [])))' "$ip_actions")"
+        while IFS= read -r ip_addr; do
+            [[ -z "$ip_addr" ]] && continue
+            ufw deny out to "$ip_addr" comment "ParentControl-ACL" >/dev/null 2>&1 || true
+        done <<< "$ip_list"
+    fi
+
+    if command -v resolvectl >/dev/null 2>&1; then
+        resolvectl flush-caches >/dev/null 2>&1 || true
+    fi
+
+    pc_log "INFO" "Enforced ACL rules across /etc/hosts and browser policies."
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized ACL State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_acl_state_json() {
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, os, sys
+
+cfg_path, feed_cache_path = sys.argv[1:3]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+acl = cfg.get("acl", {})
+wl = sorted(set(acl.get("whitelist", [])))
+bl = sorted(set(acl.get("blacklist", [])))
+feeds = acl.get("feeds", [])
+
+feed_count = 0
+if os.path.isfile(feed_cache_path):
+    with open(feed_cache_path, "r", encoding="utf-8", errors="replace") as f:
+        feed_count = sum(1 for line in f if line.strip())
+
+rules = [{"list": "whitelist", "target": item} for item in wl]
+rules.extend({"list": "blacklist", "target": item} for item in bl)
+
+print(json.dumps({
+    "whitelist": wl,
+    "blacklist": bl,
+    "rules": rules,
+    "feeds": feeds,
+    "feed_domains_count": feed_count
+}))
+' "$PC_CONFIG_FILE" "$PC_FEED_CACHE_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_add() {
+    if [[ "$ACL_LIST" != "whitelist" && "$ACL_LIST" != "blacklist" ]]; then
+        pc_emit_error "Action 'add' requires --list <whitelist|blacklist>." 2
+        exit 2
+    fi
+
+    if [[ -z "$ACL_TARGET" ]]; then
+        pc_emit_error "Action 'add' requires --target <url|domain|ip>." 2
+        exit 2
+    fi
+
+    local norm_pair kind normalized
+    if ! norm_pair="$(normalize_target "$ACL_TARGET")"; then
+        pc_emit_error "Invalid domain, URL, or IP address: '${ACL_TARGET}'" 2
+        exit 2
+    fi
+    IFS='|' read -r kind normalized <<< "$norm_pair"
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, target_list, normalized, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+acl = data.setdefault("acl", {})
+wl = set(acl.get("whitelist", []))
+bl = set(acl.get("blacklist", []))
+
+if target_list == "whitelist":
+    bl.discard(normalized)
+    bl.discard(f"www.{normalized}")
+    wl.add(normalized)
+else:
+    wl.discard(normalized)
+    wl.discard(f"www.{normalized}")
+    bl.add(normalized)
+
+acl["whitelist"] = sorted(wl)
+acl["blacklist"] = sorted(bl)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$ACL_LIST" "$normalized" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Added '${normalized}' (${kind}) to ${ACL_LIST}" "$state_json"
+}
+
+handle_remove() {
+    if [[ -n "$ACL_LIST" && "$ACL_LIST" != "whitelist" && "$ACL_LIST" != "blacklist" ]]; then
+        pc_emit_error "--list must be 'whitelist' or 'blacklist' (got: '${ACL_LIST}')." 2
+        exit 2
+    fi
+
+    if [[ -z "$ACL_TARGET" ]]; then
+        pc_emit_error "Action 'remove' requires --target <url|domain|ip>." 2
+        exit 2
+    fi
+
+    local norm_pair kind normalized
+    if ! norm_pair="$(normalize_target "$ACL_TARGET")"; then
+        normalized="$(printf '%s' "$ACL_TARGET" | tr '[:upper:]' '[:lower:]' | xargs)"
+        kind="domain"
+    else
+        IFS='|' read -r kind normalized <<< "$norm_pair"
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg removed_count
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_count="$(python3 -c '
+import json, sys
+
+cfg_path, target_list, normalized, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+acl = data.setdefault("acl", {})
+wl = set(acl.get("whitelist", []))
+bl = set(acl.get("blacklist", []))
+
+candidates = {normalized, f"www.{normalized}"}
+removed = 0
+for cand in candidates:
+    if target_list in ("", "whitelist") and cand in wl:
+        wl.remove(cand)
+        removed += 1
+    if target_list in ("", "blacklist") and cand in bl:
+        bl.remove(cand)
+        removed += 1
+
+acl["whitelist"] = sorted(wl)
+acl["blacklist"] = sorted(bl)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(removed)
+' "$PC_CONFIG_FILE" "$ACL_LIST" "$normalized" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "Target '${normalized}' was not found in ACL rules." 2
+        exit 2
+    fi
+
+    if [[ "$kind" == "ip" ]] && command -v ufw >/dev/null 2>&1; then
+        ufw delete deny out to "$normalized" >/dev/null 2>&1 || true
+    fi
+
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Removed '${normalized}' from ACL" "$state_json"
+}
+
+handle_sync() {
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_FEED_CACHE_FILE"
+
+    local tmp_cache sync_stats
+    tmp_cache="$(mktemp /tmp/pc-feed-cache.XXXXXX)"
+
+    if ! sync_stats="$(python3 -c '
+import json, re, sys, urllib.request
+
+cfg_path, override_url, out_cache_path = sys.argv[1:4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+feeds = [override_url.strip()] if override_url.strip() else cfg.get("acl", {}).get("feeds", [])
+if not feeds:
+    sys.stderr.write("No blocklist feed URLs configured.\n")
+    sys.exit(2)
+
+ignore_hosts = {
+    "localhost", "localhost.localdomain", "local", "broadcasthost",
+    "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
+    "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0", "127.0.0.1"
+}
+domain_re = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+domains = set()
+synced_feeds = 0
+
+for url in feeds:
+    if not url.startswith(("http://", "https://")):
+        continue
+    req = urllib.request.Request(url, headers={"User-Agent": "ParentControl/0.1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        for raw_bytes in resp:
+            line = raw_bytes.decode("utf-8", errors="ignore").split("#", 1)[0].strip().lower()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1"):
+                cand = parts[1].strip(".")
+            elif len(parts) == 1:
+                cand = parts[0].strip(".")
+            else:
+                continue
+            if cand in ignore_hosts or len(cand) > 253:
+                continue
+            if domain_re.match(cand):
+                domains.add(cand)
+    synced_feeds += 1
+
+sorted_domains = sorted(domains)
+with open(out_cache_path, "w", encoding="utf-8") as f:
+    if sorted_domains:
+        f.write("\n".join(sorted_domains) + "\n")
+
+print(json.dumps({"synced_feeds": synced_feeds, "cached_domains": len(sorted_domains)}))
+' "$PC_CONFIG_FILE" "$ACL_FEED_URL" "$tmp_cache")"; then
+        rm -f "$tmp_cache"
+        pc_rollback
+        pc_emit_error "Failed to download or parse blocklist feed(s)." 1
+        exit 1
+    fi
+
+    chown root:root "$tmp_cache"
+    chmod 0644 "$tmp_cache"
+    mv "$tmp_cache" "$PC_FEED_CACHE_FILE"
+
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Synchronized Pi-hole blocklist feeds (${sync_stats})" "$state_json"
+}
+
+handle_feed_config() {
+    local mode="$1" # "add" or "remove"
+    if [[ -z "$ACL_FEED_URL" ]]; then
+        pc_emit_error "Action '${mode}-feed' requires --url <http(s)://...>." 2
+        exit 2
+    fi
+
+    if [[ "$mode" == "add" && ! "$ACL_FEED_URL" =~ ^https?:// ]]; then
+        pc_emit_error "Feed URL must begin with http:// or https:// (got: '${ACL_FEED_URL}')." 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, mode, feed_url, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+acl = data.setdefault("acl", {})
+feeds = list(dict.fromkeys(acl.get("feeds", [])))
+
+if mode == "add":
+    if feed_url not in feeds:
+        feeds.append(feed_url)
+else:
+    feeds = [u for u in feeds if u != feed_url]
+
+acl["feeds"] = feeds
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$mode" "$ACL_FEED_URL" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Updated blocklist feed list (${mode}: ${ACL_FEED_URL})" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Retrieved network ACL rules" "$state_json"
+}
+
+handle_apply() {
+    pc_init_transaction
+    enforce_acl_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_acl_state_json)"
+    pc_emit_result "Applied network ACL rules to system and browsers" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_acl_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$ACL_ACTION" in
+        add)
+            handle_add
+            ;;
+        remove)
+            handle_remove
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        sync)
+            handle_sync
+            ;;
+        add-feed)
+            handle_feed_config "add"
+            ;;
+        remove-feed)
+            handle_feed_config "remove"
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${ACL_ACTION}' (expected: add, remove, list, apply, sync, add-feed, remove-feed)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_NET_ACL_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-net-acl.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-net-acl.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-perms.sh (Part 3)
+# ------------------------------------------------------------------------------
+deploy_pc_perms_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-perms.sh..."
+
+    cat << 'PC_PERMS_SH_EOF' > /opt/parentcontrol/bin/pc-perms.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Directory Permissions & RWX Enforcement Manager
+# File: /opt/parentcontrol/bin/pc-perms.sh
+#
+# Description:
+#   Enforces per-folder Read/Write/Execute (RWX) rules via POSIX ACLs (setfacl)
+#   and manages home-directory hardening presets (lock_dotfiles,
+#   restrict_extra_home_dirs, noexec_user_dirs) for the restricted user.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh perms --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     set     --path <target_path> --perms <RWX|R-X|R--|---> [--recursive] --json
+#     remove  --path <target_path> --json
+#     preset  --name <lock_dotfiles|restrict_extra_home_dirs|noexec_user_dirs> --enabled <true|false> --json
+#     list    --json
+#     apply   --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "restricted_user": "mint",
+#       "presets": {
+#         "lock_dotfiles": false,
+#         "restrict_extra_home_dirs": false,
+#         "noexec_user_dirs": false
+#       },
+#       "custom_rules": [
+#         {"path": "/home/mint/Private", "perms": "R--", "recursive": true}
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="perms"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages folder RWX permissions and home-directory hardening presets."
+PC_SCRIPT_USAGE="pc-perms.sh --action <set|remove|preset|list|apply> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         set, remove, preset, list, apply
+      --path <dir_or_file>    Target filesystem path for set/remove
+      --perms <RWX>           3-char permission string (e.g., RWX, R-X, R--, ---)
+      --recursive             Apply custom RWX rule recursively (default for directories)
+      --name <preset_name>    lock_dotfiles | restrict_extra_home_dirs | noexec_user_dirs
+      --enabled <true|false>  Enable or disable the specified preset"
+
+PERMS_ACTION=""
+TARGET_PATH=""
+RAW_PERMS=""
+RECURSIVE=1
+PRESET_NAME=""
+PRESET_ENABLED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_perms_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                PERMS_ACTION="${2:-}"
+                shift 2
+                ;;
+            --path)
+                TARGET_PATH="${2:-}"
+                shift 2
+                ;;
+            --perms)
+                RAW_PERMS="${2:-}"
+                shift 2
+                ;;
+            --recursive)
+                RECURSIVE=1
+                shift
+                ;;
+            --no-recursive)
+                RECURSIVE=0
+                shift
+                ;;
+            --name)
+                PRESET_NAME="${2:-}"
+                shift 2
+                ;;
+            --enabled)
+                PRESET_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-perms.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$PERMS_ACTION" ]]; then
+        pc_emit_error "Missing required --action <set|remove|preset|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$PERMS_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Ensure setfacl & Restricted User Are Ready
+# ------------------------------------------------------------------------------
+ensure_acl_tool() {
+    if ! command -v setfacl >/dev/null 2>&1; then
+        pc_log "INFO" "setfacl not found; installing 'acl' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
+    fi
+}
+
+get_restricted_user() {
+    pc_ensure_config_exists
+    local r_user
+    r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]]; then
+        pc_emit_error "No restricted_user configured in config.json. Run pc-setup.sh first." 2
+        exit 2
+    fi
+    if ! id -u "$r_user" >/dev/null 2>&1; then
+        pc_emit_error "Configured restricted_user '${r_user}' does not exist on this system." 1
+        exit 1
+    fi
+    printf '%s' "$r_user"
+}
+
+# ------------------------------------------------------------------------------
+# Validate Target Path & Normalize RWX String
+# ------------------------------------------------------------------------------
+validate_and_resolve_path() {
+    local input_path="$1"
+    if [[ -z "$input_path" ]]; then
+        pc_emit_error "Target --path cannot be empty." 2
+        exit 2
+    fi
+
+    if [[ ! -e "$input_path" ]]; then
+        pc_emit_error "Target path does not exist: '${input_path}'" 2
+        exit 2
+    fi
+
+    local resolved
+    resolved="$(realpath -e "$input_path")"
+
+    # Guard critical OS system roots from accidental permission lockouts
+    case "$resolved" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/libx32|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+            pc_emit_error "Refusing to modify permissions on critical system directory: '${resolved}'" 2
+            exit 2
+            ;;
+        /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/root/*|/run/*|/sbin/*|/sys/*|/usr/*|/var/*)
+            pc_emit_error "Refusing to modify permissions inside protected OS path: '${resolved}'" 2
+            exit 2
+            ;;
+    esac
+
+    printf '%s' "$resolved"
+}
+
+normalize_rwx_string() {
+    local input_perms="$1"
+    python3 -c '
+import sys
+raw = sys.argv[1].strip().upper()
+if len(raw) != 3:
+    sys.exit(1)
+if raw[0] not in ("R", "-") or raw[1] not in ("W", "-") or raw[2] not in ("X", "-"):
+    sys.exit(1)
+print(raw)
+' "$input_perms"
+}
+
+# ------------------------------------------------------------------------------
+# Low-Level POSIX ACL Application Helpers
+# ------------------------------------------------------------------------------
+apply_single_rwx_rule() {
+    local r_user="$1"
+    local target_path="$2"
+    local rwx_upper="$3"
+    local is_recursive="$4"
+
+    [[ -e "$target_path" ]] || return 0
+
+    local acl_perms
+    acl_perms="$(printf '%s' "$rwx_upper" | tr '[:upper:]' '[:lower:]')"
+
+    local rec_flag=()
+    if [[ "$is_recursive" -eq 1 && -d "$target_path" ]]; then
+        rec_flag=(-R)
+    fi
+
+    setfacl "${rec_flag[@]}" -m "u:${r_user}:${acl_perms}" "$target_path"
+
+    if [[ -d "$target_path" ]]; then
+        # Ensure newly created files/dirs inside this directory inherit the rule
+        setfacl "${rec_flag[@]}" -d -m "u:${r_user}:${acl_perms}" "$target_path" 2>/dev/null || true
+    fi
+}
+
+clear_single_rwx_rule() {
+    local r_user="$1"
+    local target_path="$2"
+
+    [[ -e "$target_path" ]] || return 0
+
+    if [[ -d "$target_path" ]]; then
+        setfacl -R -x "u:${r_user}" "$target_path" 2>/dev/null || true
+        setfacl -R -d -x "u:${r_user}" "$target_path" 2>/dev/null || true
+    else
+        setfacl -x "u:${r_user}" "$target_path" 2>/dev/null || true
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Home Directory Security Presets
+# ------------------------------------------------------------------------------
+apply_preset_state() {
+    local r_user="$1"
+    local preset="$2"
+    local enabled="$3"
+    local user_home
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+        pc_emit_error "Home directory not found for user '${r_user}'." 1
+        exit 1
+    fi
+
+    local r_group
+    r_group="$(id -gn "$r_user")"
+
+    case "$preset" in
+        lock_dotfiles)
+            local critical_files=(".bashrc" ".profile" ".bash_profile" ".zshrc" ".xinitrc" ".xsessionrc")
+            local critical_dirs=(".config/autostart" ".local/share/applications")
+
+            for f in "${critical_files[@]}"; do
+                local fp="${user_home}/${f}"
+                if [[ "$enabled" == "true" ]]; then
+                    [[ ! -e "$fp" ]] && touch "$fp"
+                    chown root:root "$fp"
+                    chmod 0644 "$fp"
+                elif [[ -e "$fp" ]]; then
+                    chown "${r_user}:${r_group}" "$fp"
+                    chmod 0644 "$fp"
+                fi
+            done
+
+            for d in "${critical_dirs[@]}"; do
+                local dp="${user_home}/${d}"
+                if [[ "$enabled" == "true" ]]; then
+                    mkdir -p "$dp"
+                    chown -R root:root "$dp"
+                    chmod -R go-w "$dp"
+                    chmod 0755 "$dp"
+                elif [[ -d "$dp" ]]; then
+                    chown -R "${r_user}:${r_group}" "$dp"
+                    chmod 0755 "$dp"
+                fi
+            done
+            ;;
+
+        restrict_extra_home_dirs)
+            shopt -s nullglob
+            for entry in "${user_home}"/*; do
+                local base_name
+                base_name="$(basename "$entry")"
+                local is_standard=0
+                for std_dir in "${PC_STANDARD_HOME_DIRS[@]}"; do
+                    if [[ "$base_name" == "$std_dir" ]]; then
+                        is_standard=1
+                        break
+                    fi
+                done
+                if [[ "$is_standard" -eq 0 ]]; then
+                    if [[ "$enabled" == "true" ]]; then
+                        setfacl -R -m "u:${r_user}:---" "$entry"
+                        [[ -d "$entry" ]] && setfacl -R -d -m "u:${r_user}:---" "$entry" 2>/dev/null || true
+                    else
+                        clear_single_rwx_rule "$r_user" "$entry"
+                    fi
+                fi
+            done
+            shopt -u nullglob
+            ;;
+
+        noexec_user_dirs)
+            local target_dirs=("Downloads" "Desktop" "Documents" "Public" "Templates")
+            for sub in "${target_dirs[@]}"; do
+                local dp="${user_home}/${sub}"
+                [[ -d "$dp" ]] || continue
+                if [[ "$enabled" == "true" ]]; then
+                    # rwX grants execute ONLY on directories (for traversal), never on regular files
+                    setfacl -R -m "u:${r_user}:rwX" "$dp"
+                    setfacl -R -d -m "u:${r_user}:rw-" "$dp" 2>/dev/null || true
+                    find "$dp" -type f -exec setfacl -m "u:${r_user}:rw-" {} + 2>/dev/null || true
+                else
+                    clear_single_rwx_rule "$r_user" "$dp"
+                fi
+            done
+            ;;
+
+        *)
+            pc_emit_error "Unknown preset '${preset}' (expected: lock_dotfiles, restrict_extra_home_dirs, noexec_user_dirs)." 2
+            exit 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Permissions State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_perms_state_json() {
+    pc_ensure_config_exists
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+perms = cfg.get("permissions", {})
+print(json.dumps({
+    "restricted_user": cfg.get("restricted_user", ""),
+    "presets": {
+        "lock_dotfiles": bool(perms.get("lock_dotfiles", False)),
+        "restrict_extra_home_dirs": bool(perms.get("restrict_extra_home_dirs", False)),
+        "noexec_user_dirs": bool(perms.get("noexec_user_dirs", False))
+    },
+    "custom_rules": perms.get("custom_rules", [])
+}))
+' "$PC_CONFIG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_set() {
+    local r_user resolved_path norm_perms
+    r_user="$(get_restricted_user)"
+    resolved_path="$(validate_and_resolve_path "$TARGET_PATH")"
+
+    if [[ -z "$RAW_PERMS" ]]; then
+        pc_emit_error "Action 'set' requires --perms <RWX|R-X|R--|--->." 2
+        exit 2
+    fi
+
+    if ! norm_perms="$(normalize_rwx_string "$RAW_PERMS")"; then
+        pc_emit_error "Invalid --perms '${RAW_PERMS}'. Must be 3 characters using R/W/X/- (e.g., RWX, R-X, R--, ---)." 2
+        exit 2
+    fi
+
+    ensure_acl_tool
+    pc_init_transaction
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    apply_single_rwx_rule "$r_user" "$resolved_path" "$norm_perms" "$RECURSIVE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, target_path, perms_str, rec_flag, out_path = sys.argv[1:6]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+perms = data.setdefault("permissions", {})
+rules = [r for r in perms.get("custom_rules", []) if r.get("path") != target_path]
+rules.append({
+    "path": target_path,
+    "perms": perms_str,
+    "recursive": rec_flag == "1"
+})
+rules.sort(key=lambda r: r.get("path", ""))
+perms["custom_rules"] = rules
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$resolved_path" "$norm_perms" "$RECURSIVE" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Applied [${norm_perms}] permissions on '${resolved_path}' for '${r_user}'" "$state_json"
+}
+
+handle_remove() {
+    if [[ -z "$TARGET_PATH" ]]; then
+        pc_emit_error "Action 'remove' requires --path <target_path>." 2
+        exit 2
+    fi
+
+    local r_user resolved_path
+    r_user="$(get_restricted_user)"
+    if [[ -e "$TARGET_PATH" ]]; then
+        resolved_path="$(realpath -e "$TARGET_PATH")"
+    else
+        resolved_path="$TARGET_PATH"
+    fi
+
+    ensure_acl_tool
+    pc_init_transaction
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    clear_single_rwx_rule "$r_user" "$resolved_path"
+
+    local tmp_cfg removed_count
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_count="$(python3 -c '
+import json, sys
+
+cfg_path, target_path, out_path = sys.argv[1:4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+perms = data.setdefault("permissions", {})
+old_rules = perms.get("custom_rules", [])
+new_rules = [r for r in old_rules if r.get("path") != target_path]
+perms["custom_rules"] = new_rules
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(len(old_rules) - len(new_rules))
+' "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No saved permission rule found for '${resolved_path}'." 2
+        exit 2
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Removed custom permission rule for '${resolved_path}'" "$state_json"
+}
+
+handle_preset() {
+    if [[ -z "$PRESET_NAME" ]]; then
+        pc_emit_error "Action 'preset' requires --name <lock_dotfiles|restrict_extra_home_dirs|noexec_user_dirs>." 2
+        exit 2
+    fi
+
+    if [[ "$PRESET_ENABLED" != "true" && "$PRESET_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'preset' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    local r_user
+    r_user="$(get_restricted_user)"
+    ensure_acl_tool
+
+    pc_init_transaction
+    apply_preset_state "$r_user" "$PRESET_NAME" "$PRESET_ENABLED"
+    pc_json_set "permissions.${PRESET_NAME}" "$PRESET_ENABLED"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Set permission preset '${PRESET_NAME}' to ${PRESET_ENABLED}" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Retrieved directory permission rules and presets" "$state_json"
+}
+
+handle_apply() {
+    local r_user
+    r_user="$(get_restricted_user)"
+    ensure_acl_tool
+
+    pc_init_transaction
+
+    for preset in lock_dotfiles restrict_extra_home_dirs noexec_user_dirs; do
+        local is_on
+        is_on="$(pc_json_get "permissions.${preset}" 2>/dev/null || printf 'false')"
+        apply_preset_state "$r_user" "$preset" "$is_on"
+    done
+
+    local rules_lines
+    rules_lines="$(python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for r in cfg.get("permissions", {}).get("custom_rules", []):
+    rec = "1" if r.get("recursive", True) else "0"
+    print(f"{r.get(\"path\", \"\")}|{r.get(\"perms\", \"R-X\")}|{rec}")
+' "$PC_CONFIG_FILE")"
+
+    while IFS='|' read -r r_path r_perms r_rec; do
+        [[ -z "$r_path" ]] && continue
+        apply_single_rwx_rule "$r_user" "$r_path" "$r_perms" "$r_rec"
+    done <<< "$rules_lines"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_perms_state_json)"
+    pc_emit_result "Applied all directory permissions and presets for '${r_user}'" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_perms_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$PERMS_ACTION" in
+        set)
+            handle_set
+            ;;
+        remove)
+            handle_remove
+            ;;
+        preset)
+            handle_preset
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${PERMS_ACTION}' (expected: set, remove, preset, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_PERMS_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-perms.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-perms.sh
+}
+
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-ports.sh (Sub-Chunk 4.1)
+# ------------------------------------------------------------------------------
+deploy_pc_ports_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-ports.sh..."
+
+    cat << 'PC_PORTS_SH_EOF' > /opt/parentcontrol/bin/pc-ports.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Network Port & UFW Firewall Manager
+# File: /opt/parentcontrol/bin/pc-ports.sh
+#
+# Description:
+#   Manages blocked TCP/UDP ports in config.json and enforces inbound/outbound
+#   port rules via Uncomplicated Firewall (ufw) on Linux Mint 22.3.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh ports --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     block   --port <1-65535> [--protocol <TCP|UDP|BOTH>] --json   (alias: add)
+#     unblock --port <1-65535> [--protocol <TCP|UDP|BOTH>] --json   (alias: remove)
+#     list    --json
+#     apply   --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "ufw_active": true,
+#       "blocked_ports": [
+#         {"port": 6667, "protocol": "TCP"}
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="ports"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages blocked network ports via UFW firewall rules."
+PC_SCRIPT_USAGE="pc-ports.sh --action <block|unblock|list|apply> [--port <1-65535>] [--protocol <TCP|UDP|BOTH>] [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         block (add), unblock (remove), list, apply
+      --port <number>         TCP/UDP port number (1-65535)
+      --protocol <proto>      TCP, UDP, or BOTH (default: BOTH)"
+
+PORTS_ACTION=""
+TARGET_PORT=""
+TARGET_PROTO="BOTH"
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_ports_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                PORTS_ACTION="${2:-}"
+                shift 2
+                ;;
+            --port)
+                TARGET_PORT="${2:-}"
+                shift 2
+                ;;
+            --protocol)
+                TARGET_PROTO="$(printf '%s' "${2:-}" | tr '[:lower:]' '[:upper:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-ports.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$PORTS_ACTION" ]]; then
+        pc_emit_error "Missing required --action <block|unblock|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$PORTS_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Validation & UFW Helpers
+# ------------------------------------------------------------------------------
+validate_port_and_proto() {
+    if [[ -z "$TARGET_PORT" ]] || ! [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || \
+       [[ "$TARGET_PORT" -lt 1 || "$TARGET_PORT" -gt 65535 ]]; then
+        pc_emit_error "Invalid --port '${TARGET_PORT}'. Must be an integer between 1 and 65535." 2
+        exit 2
+    fi
+
+    # Strip leading zeros (e.g., 0080 -> 80)
+    TARGET_PORT="$((10#$TARGET_PORT))"
+
+    case "$TARGET_PROTO" in
+        TCP|UDP|BOTH)
+            ;;
+        *)
+            pc_emit_error "Invalid --protocol '${TARGET_PROTO}'. Must be TCP, UDP, or BOTH." 2
+            exit 2
+            ;;
+    esac
+}
+
+ensure_ufw_ready() {
+    if ! command -v ufw >/dev/null 2>&1; then
+        pc_log "INFO" "ufw not found; installing 'ufw' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw >/dev/null
+    fi
+
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        pc_log "INFO" "Enabling UFW firewall with default incoming deny / outgoing allow..."
+        ufw default deny incoming >/dev/null
+        ufw default allow outgoing >/dev/null
+        ufw --force enable >/dev/null
+    fi
+}
+
+apply_ufw_port_rule() {
+    local port="$1"
+    local proto="$2"
+    local mode="$3" # "block" or "unblock"
+
+    local protos=()
+    if [[ "$proto" == "BOTH" ]]; then
+        protos=("tcp" "udp")
+    else
+        protos=("$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')")
+    fi
+
+    for p in "${protos[@]}"; do
+        if [[ "$mode" == "block" ]]; then
+            ufw deny out "${port}/${p}" comment "ParentControl-Port" >/dev/null 2>&1 || true
+            ufw deny in "${port}/${p}" comment "ParentControl-Port" >/dev/null 2>&1 || true
+        else
+            ufw delete deny out "${port}/${p}" >/dev/null 2>&1 || true
+            ufw delete deny in "${port}/${p}" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Ports State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_ports_state_json() {
+    pc_ensure_config_exists
+
+    local ufw_on="false"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_on="true"
+    fi
+
+    python3 -c '
+import json, sys
+
+cfg_path, ufw_active_str = sys.argv[1:3]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+raw_blocked = cfg.get("ports", {}).get("blocked", [])
+normalized = []
+for item in raw_blocked:
+    if isinstance(item, dict) and "port" in item:
+        normalized.append({
+            "port": int(item["port"]),
+            "protocol": str(item.get("protocol", "BOTH")).upper()
+        })
+    elif isinstance(item, int):
+        normalized.append({"port": item, "protocol": "BOTH"})
+
+normalized.sort(key=lambda x: (x["port"], x["protocol"]))
+
+print(json.dumps({
+    "ufw_active": ufw_active_str == "true",
+    "blocked_ports": normalized
+}))
+' "$PC_CONFIG_FILE" "$ufw_on"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_block() {
+    validate_port_and_proto
+    ensure_ufw_ready
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    # If upgrading an existing TCP or UDP rule to BOTH, remove single-proto UFW rule first
+    if [[ "$TARGET_PROTO" == "BOTH" ]]; then
+        apply_ufw_port_rule "$TARGET_PORT" "BOTH" "block"
+    else
+        apply_ufw_port_rule "$TARGET_PORT" "$TARGET_PROTO" "block"
+    fi
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, port_num, proto_str, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+ports_cfg = data.setdefault("ports", {})
+existing = ports_cfg.get("blocked", [])
+
+cleaned = []
+for entry in existing:
+    if isinstance(entry, dict) and int(entry.get("port", -1)) == port_num:
+        # Replace existing rule on the same port if upgrading to BOTH or matching protocol
+        if proto_str == "BOTH" or str(entry.get("protocol", "")).upper() in (proto_str, "BOTH"):
+            continue
+    elif isinstance(entry, int) and entry == port_num:
+        continue
+    cleaned.append(entry)
+
+cleaned.append({"port": port_num, "protocol": proto_str})
+cleaned.sort(key=lambda x: (int(x["port"]), str(x["protocol"])))
+ports_cfg["blocked"] = cleaned
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$TARGET_PORT" "$TARGET_PROTO" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Blocked port ${TARGET_PORT}/${TARGET_PROTO} via UFW" "$state_json"
+}
+
+handle_unblock() {
+    validate_port_and_proto
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg removed_count
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_count="$(python3 -c '
+import json, sys
+
+cfg_path, port_num, proto_str, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+ports_cfg = data.setdefault("ports", {})
+existing = ports_cfg.get("blocked", [])
+
+kept = []
+removed = 0
+for entry in existing:
+    if isinstance(entry, dict) and int(entry.get("port", -1)) == port_num:
+        entry_proto = str(entry.get("protocol", "BOTH")).upper()
+        if proto_str == "BOTH" or entry_proto == proto_str:
+            removed += 1
+            continue
+        elif entry_proto == "BOTH" and proto_str in ("TCP", "UDP"):
+            # Downgrade BOTH to the remaining protocol
+            other = "UDP" if proto_str == "TCP" else "TCP"
+            kept.append({"port": port_num, "protocol": other})
+            removed += 1
+            continue
+    elif isinstance(entry, int) and entry == port_num:
+        removed += 1
+        continue
+    kept.append(entry)
+
+ports_cfg["blocked"] = kept
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(removed)
+' "$PC_CONFIG_FILE" "$TARGET_PORT" "$TARGET_PROTO" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No blocked port rule found for ${TARGET_PORT}/${TARGET_PROTO}." 2
+        exit 2
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        apply_ufw_port_rule "$TARGET_PORT" "$TARGET_PROTO" "unblock"
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Unblocked port ${TARGET_PORT}/${TARGET_PROTO}" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Retrieved blocked network ports" "$state_json"
+}
+
+handle_apply() {
+    pc_ensure_config_exists
+
+    local rule_lines
+    rule_lines="$(python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for entry in cfg.get("ports", {}).get("blocked", []):
+    if isinstance(entry, dict) and "port" in entry:
+        print(f"{int(entry[\"port\"])}|{str(entry.get(\"protocol\", \"BOTH\")).upper()}")
+    elif isinstance(entry, int):
+        print(f"{entry}|BOTH")
+' "$PC_CONFIG_FILE")"
+
+    if [[ -n "$rule_lines" ]]; then
+        ensure_ufw_ready
+        while IFS='|' read -r p_num p_proto; do
+            [[ -z "$p_num" ]] && continue
+            apply_ufw_port_rule "$p_num" "$p_proto" "block"
+        done <<< "$rule_lines"
+    fi
+
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Applied all network port firewall rules" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_ports_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$PORTS_ACTION" in
+        block|add)
+            handle_block
+            ;;
+        unblock|remove)
+            handle_unblock
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${PORTS_ACTION}' (expected: block, unblock, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_PORTS_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-ports.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-ports.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-devices.sh (Sub-Chunk 4.2)
+# ------------------------------------------------------------------------------
+deploy_pc_devices_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-devices.sh..."
+
+    cat << 'PC_DEVICES_SH_EOF' > /opt/parentcontrol/bin/pc-devices.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Hardware & Peripheral Access Control Manager
+# File: /opt/parentcontrol/bin/pc-devices.sh
+#
+# Description:
+#   Manages hardware peripheral restrictions (USB mass storage, webcam,
+#   microphone, Bluetooth) in config.json and enforces them across modprobe,
+#   udev rules, device nodes, and rfkill on Linux Mint 22.3.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh devices --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     block   --device <usb_storage|webcam|microphone|bluetooth> --json
+#     unblock --device <usb_storage|webcam|microphone|bluetooth> --json
+#     set     --device <usb_storage|webcam|microphone|bluetooth> --blocked <true|false> --json
+#     list    --json
+#     apply   --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "devices": {
+#         "usb_storage": false,
+#         "webcam": false,
+#         "microphone": false,
+#         "bluetooth": false
+#       },
+#       "rules": [
+#         {"device": "usb_storage", "label": "USB Mass Storage", "blocked": false},
+#         {"device": "webcam", "label": "Webcam / Camera", "blocked": false},
+#         {"device": "microphone", "label": "Microphone / Audio Input", "blocked": false},
+#         {"device": "bluetooth", "label": "Bluetooth", "blocked": false}
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="devices"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages hardware peripheral blocks (USB storage, webcam, microphone, Bluetooth)."
+PC_SCRIPT_USAGE="pc-devices.sh --action <block|unblock|set|list|apply> [--device <name>] [--blocked <true|false>] [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         block, unblock, set, list, apply
+      --device <name>         usb_storage | webcam | microphone | bluetooth
+      --blocked <true|false>  Target state when using --action set"
+
+readonly PC_MODPROBE_CONF="/etc/modprobe.d/parentcontrol-devices.conf"
+readonly PC_UDEV_RULES="/etc/udev/rules.d/99-parentcontrol-devices.rules"
+
+DEVICES_ACTION=""
+TARGET_DEVICE=""
+TARGET_BLOCKED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_devices_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                DEVICES_ACTION="${2:-}"
+                shift 2
+                ;;
+            --device)
+                TARGET_DEVICE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+                shift 2
+                ;;
+            --blocked)
+                TARGET_BLOCKED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-devices.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$DEVICES_ACTION" ]]; then
+        pc_emit_error "Missing required --action <block|unblock|set|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$DEVICES_ACTION"
+}
+
+validate_device_name() {
+    case "$TARGET_DEVICE" in
+        usb_storage|webcam|microphone|bluetooth)
+            ;;
+        *)
+            pc_emit_error "Invalid --device '${TARGET_DEVICE}'. Must be one of: usb_storage, webcam, microphone, bluetooth." 2
+            exit 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Enforce Device Rules via modprobe, udev, /dev/snd, and rfkill
+# ------------------------------------------------------------------------------
+enforce_device_rules() {
+    pc_ensure_config_exists
+
+    pc_backup_file "$PC_MODPROBE_CONF"
+    pc_backup_file "$PC_UDEV_RULES"
+
+    mkdir -p /etc/modprobe.d /etc/udev/rules.d
+
+    local state_flags
+    state_flags="$(python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+devs = cfg.get("devices", {})
+usb = "1" if devs.get("usb_storage", False) else "0"
+cam = "1" if devs.get("webcam", False) else "0"
+mic = "1" if devs.get("microphone", False) else "0"
+bt  = "1" if devs.get("bluetooth", False) else "0"
+print(f"{usb}|{cam}|{mic}|{bt}")
+' "$PC_CONFIG_FILE")"
+
+    local block_usb block_cam block_mic block_bt
+    IFS='|' read -r block_usb block_cam block_mic block_bt <<< "$state_flags"
+
+    local tmp_modprobe tmp_udev
+    tmp_modprobe="$(mktemp /tmp/pc-modprobe.XXXXXX)"
+    tmp_udev="$(mktemp /tmp/pc-udev.XXXXXX)"
+
+    cat << 'HEADER_EOF' > "$tmp_modprobe"
+# Managed by ParentControl (pc-devices.sh) - DO NOT EDIT MANUALLY
+HEADER_EOF
+
+    cat << 'HEADER_EOF' > "$tmp_udev"
+# Managed by ParentControl (pc-devices.sh) - DO NOT EDIT MANUALLY
+HEADER_EOF
+
+    # 1. USB Mass Storage (preserves USB keyboards/mice via HID class 03)
+    if [[ "$block_usb" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_modprobe"
+blacklist usb-storage
+install usb-storage /bin/false
+blacklist uas
+install uas /bin/false
+EOF
+        cat << 'EOF' >> "$tmp_udev"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="08", RUN+="/bin/sh -c 'echo 0 > /sys$devpath/../authorized 2>/dev/null || true'"
+EOF
+        modprobe -r uas 2>/dev/null || true
+        modprobe -r usb_storage 2>/dev/null || true
+    fi
+
+    # 2. Webcam / Video Capture
+    if [[ "$block_cam" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_modprobe"
+blacklist uvcvideo
+install uvcvideo /bin/false
+EOF
+        cat << 'EOF' >> "$tmp_udev"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="0e", RUN+="/bin/sh -c 'echo 0 > /sys$devpath/../authorized 2>/dev/null || true'"
+EOF
+        modprobe -r uvcvideo 2>/dev/null || true
+    fi
+
+    # 3. Microphone / ALSA Capture Nodes (preserves speaker playback nodes pcm*p)
+    if [[ "$block_mic" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_udev"
+SUBSYSTEM=="sound", KERNEL=="pcm*c", MODE="0000", OPTIONS+="last_rule"
+EOF
+    fi
+
+    # 4. Bluetooth
+    if [[ "$block_bt" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_modprobe"
+blacklist btusb
+install btusb /bin/false
+blacklist bluetooth
+install bluetooth /bin/false
+EOF
+        cat << 'EOF' >> "$tmp_udev"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="e0", ATTR{bInterfaceSubClass}=="01", ATTR{bInterfaceProtocol}=="01", RUN+="/bin/sh -c 'echo 0 > /sys$devpath/../authorized 2>/dev/null || true'"
+EOF
+        if command -v rfkill >/dev/null 2>&1; then
+            rfkill block bluetooth >/dev/null 2>&1 || true
+        fi
+        modprobe -r btusb 2>/dev/null || true
+    else
+        if command -v rfkill >/dev/null 2>&1; then
+            rfkill unblock bluetooth >/dev/null 2>&1 || true
+        fi
+    fi
+
+    chown root:root "$tmp_modprobe" "$tmp_udev"
+    chmod 0644 "$tmp_modprobe" "$tmp_udev"
+    mv "$tmp_modprobe" "$PC_MODPROBE_CONF"
+    mv "$tmp_udev" "$PC_UDEV_RULES"
+
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+
+    # Apply or restore live microphone capture node permissions immediately
+    if [[ "$block_mic" == "1" ]]; then
+        shopt -s nullglob
+        for cap_dev in /dev/snd/pcm*c; do
+            setfacl -b "$cap_dev" 2>/dev/null || true
+            chmod 0000 "$cap_dev" 2>/dev/null || true
+        done
+        shopt -u nullglob
+    else
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm trigger --subsystem-match=sound >/dev/null 2>&1 || true
+        fi
+    fi
+
+    pc_log "INFO" "Enforced device policies (usb_storage=${block_usb}, webcam=${block_cam}, microphone=${block_mic}, bluetooth=${block_bt})."
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Devices State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_devices_state_json() {
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+devs = cfg.get("devices", {})
+state = {
+    "usb_storage": bool(devs.get("usb_storage", False)),
+    "webcam": bool(devs.get("webcam", False)),
+    "microphone": bool(devs.get("microphone", False)),
+    "bluetooth": bool(devs.get("bluetooth", False))
+}
+
+labels = {
+    "usb_storage": "USB Mass Storage",
+    "webcam": "Webcam / Camera",
+    "microphone": "Microphone / Audio Input",
+    "bluetooth": "Bluetooth"
+}
+
+rules = [
+    {"device": key, "label": labels[key], "blocked": state[key]}
+    for key in ("usb_storage", "webcam", "microphone", "bluetooth")
+]
+
+print(json.dumps({
+    "devices": state,
+    "rules": rules
+}))
+' "$PC_CONFIG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+set_device_blocked_state() {
+    local dev_name="$1"
+    local is_blocked="$2" # "true" or "false"
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, dev_key, blocked_str, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+devs = data.setdefault("devices", {
+    "usb_storage": False,
+    "webcam": False,
+    "microphone": False,
+    "bluetooth": False
+})
+devs[dev_key] = (blocked_str == "true")
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$dev_name" "$is_blocked" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    enforce_device_rules
+    pc_commit_transaction
+
+    local verb_word="Blocked"
+    [[ "$is_blocked" == "false" ]] && verb_word="Unblocked"
+
+    local state_json
+    state_json="$(build_devices_state_json)"
+    pc_emit_result "${verb_word} hardware device '${dev_name}'" "$state_json"
+}
+
+handle_block() {
+    validate_device_name
+    set_device_blocked_state "$TARGET_DEVICE" "true"
+}
+
+handle_unblock() {
+    validate_device_name
+    set_device_blocked_state "$TARGET_DEVICE" "false"
+}
+
+handle_set() {
+    validate_device_name
+    if [[ "$TARGET_BLOCKED" != "true" && "$TARGET_BLOCKED" != "false" ]]; then
+        pc_emit_error "Action 'set' requires --blocked <true|false>." 2
+        exit 2
+    fi
+    set_device_blocked_state "$TARGET_DEVICE" "$TARGET_BLOCKED"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_devices_state_json)"
+    pc_emit_result "Retrieved hardware device control states" "$state_json"
+}
+
+handle_apply() {
+    pc_init_transaction
+    enforce_device_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_devices_state_json)"
+    pc_emit_result "Applied all hardware device control rules" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_devices_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$DEVICES_ACTION" in
+        block)
+            handle_block
+            ;;
+        unblock)
+            handle_unblock
+            ;;
+        set)
+            handle_set
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${DEVICES_ACTION}' (expected: block, unblock, set, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_DEVICES_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-devices.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-devices.sh
+}
+
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-apps.sh (Part 5)
+# ------------------------------------------------------------------------------
+deploy_pc_apps_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-apps.sh..."
+
+    cat << 'PC_APPS_SH_EOF' > /opt/parentcontrol/bin/pc-apps.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Application & Package Governance Manager
+# File: /opt/parentcontrol/bin/pc-apps.sh
+#
+# Description:
+#   Manages per-user application Allow/Block rules (via POSIX ACLs on binaries
+#   plus root-owned .desktop menu/Desktop hiding), Software Manager/APT lock
+#   policies, and explicit package uninstalls on Linux Mint 22.3.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh apps --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     block            --app <name|desktop|binary> --json
+#     allow            --app <name|desktop|binary> --json   (alias: unblock)
+#     set              --app <name|desktop|binary> --status <Allow|Block> --json
+#     remove           --app <name|desktop|binary> --json
+#     lock-installers  --enabled <true|false> --json
+#     uninstall        --app <name|desktop|binary|pkg> --json
+#     scan             --json
+#     list             --json
+#     apply            --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "restricted_user": "mint",
+#       "lock_installers": false,
+#       "rules": [
+#         {
+#           "app": "Calculator",
+#           "name": "Calculator",
+#           "desktop_id": "org.gnome.Calculator.desktop",
+#           "binary_path": "/usr/bin/gnome-calculator",
+#           "flatpak_id": "",
+#           "status": "block"
+#         }
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="apps"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages application Allow/Block rules, icon hiding, installer locks, and package removal."
+PC_SCRIPT_USAGE="pc-apps.sh --action <block|allow|set|remove|lock-installers|uninstall|scan|list|apply> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         block, allow, set, remove, lock-installers, uninstall, scan, list, apply
+      --app <identifier>      Desktop Name, .desktop filename, command, or package name
+      --status <Allow|Block>  Target state when using --action set
+      --enabled <true|false>  Target state when using --action lock-installers"
+
+readonly PC_DESKTOP_QUARANTINE_BASE="${PC_VAR_DIR}/quarantine/desktop"
+
+APPS_ACTION=""
+TARGET_APP=""
+TARGET_STATUS=""
+LOCK_ENABLED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_apps_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                APPS_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --app)
+                TARGET_APP="${2:-}"
+                shift 2
+                ;;
+            --status)
+                TARGET_STATUS="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --enabled)
+                LOCK_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-apps.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$APPS_ACTION" ]]; then
+        pc_emit_error "Missing required --action <block|allow|set|remove|lock-installers|uninstall|scan|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$APPS_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Helpers: ACL Tool & Restricted User Lookup
+# ------------------------------------------------------------------------------
+ensure_acl_tool() {
+    if ! command -v setfacl >/dev/null 2>&1; then
+        pc_log "INFO" "setfacl not found; installing 'acl' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null
+    fi
+}
+
+get_restricted_user() {
+    pc_ensure_config_exists
+    local r_user
+    r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]]; then
+        pc_emit_error "No restricted_user configured in config.json. Run pc-setup.sh first." 2
+        exit 2
+    fi
+    if ! id -u "$r_user" >/dev/null 2>&1; then
+        pc_emit_error "Configured restricted_user '${r_user}' does not exist on this system." 1
+        exit 1
+    fi
+    printf '%s' "$r_user"
+}
+
+# ------------------------------------------------------------------------------
+# Safeguard: Never Block Essential Desktop / Session / System Binaries
+# ------------------------------------------------------------------------------
+is_protected_binary() {
+    local bin_path="$1"
+    [[ -z "$bin_path" ]] && return 0
+
+    local base
+    base="$(basename "$bin_path")"
+    case "$base" in
+        bash|sh|dash|zsh|sudo|su|pkexec|polkitd|systemd|init|lightdm|slick-greeter|\
+        cinnamon|cinnamon-session|cinnamon-settings|nemo|muffin|Xorg|dbus-daemon|\
+        python3|python3.*|perl|env|coreutils|login|passwd|chpasswd|setfacl|getfacl|\
+        flatpak|snap|apt|apt-get|dpkg)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# ------------------------------------------------------------------------------
+# Resolve Application Metadata from .desktop Files or $PATH
+# Outputs JSON: {"name":..., "desktop_id":..., "exec_cmd":..., "binary_path":..., "flatpak_id":...}
+# ------------------------------------------------------------------------------
+resolve_app_metadata() {
+    local query="$1"
+    local user_home="$2"
+
+    python3 -c '
+import glob, json, os, shlex, shutil, sys
+
+query = sys.argv[1].strip()
+user_home = sys.argv[2].strip()
+q_lower = query.lower()
+
+search_dirs = [
+    "/usr/share/applications",
+    "/usr/local/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+]
+if user_home:
+    search_dirs.append(os.path.join(user_home, ".local/share/applications"))
+    search_dirs.append(os.path.join(user_home, ".local/share/flatpak/exports/share/applications"))
+
+def parse_desktop(path):
+    name = ""
+    exec_raw = ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            in_main = False
+            for line in f:
+                s = line.strip()
+                if s.startswith("[") and s.endswith("]"):
+                    in_main = (s == "[Desktop Entry]")
+                    continue
+                if not in_main or "=" not in s or s.startswith("#"):
+                    continue
+                k, v = s.split("=", 1)
+                if k == "Name" and not name:
+                    name = v.strip()
+                elif k == "Exec" and not exec_raw:
+                    exec_raw = v.strip()
+    except Exception:
+        return None
+    if not name and not exec_raw:
+        return None
+    return {"name": name, "exec_raw": exec_raw, "desktop_id": os.path.basename(path)}
+
+def extract_exec_details(exec_raw):
+    if not exec_raw:
+        return "", "", ""
+    try:
+        tokens = shlex.split(exec_raw)
+    except ValueError:
+        tokens = exec_raw.split()
+
+    # Strip env wrapper if present (e.g., env BAMF_DESKTOP_FILE_HINT=... cmd)
+    idx = 0
+    if tokens and os.path.basename(tokens[0]) == "env":
+        idx = 1
+        while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("/"):
+            idx += 1
+    tokens = tokens[idx:]
+    if not tokens:
+        return "", "", ""
+
+    cmd = tokens[0]
+    base_cmd = os.path.basename(cmd)
+    flatpak_id = ""
+    if base_cmd == "flatpak" and "run" in tokens[1:]:
+        run_idx = tokens.index("run")
+        for arg in tokens[run_idx + 1:]:
+            if not arg.startswith("-") and not arg.startswith("%"):
+                flatpak_id = arg
+                break
+
+    bin_path = ""
+    if not flatpak_id:
+        if os.path.isabs(cmd) and os.path.exists(cmd):
+            bin_path = os.path.realpath(cmd)
+        else:
+            found = shutil.which(cmd)
+            if found:
+                bin_path = os.path.realpath(found)
+
+    return base_cmd, bin_path, flatpak_id
+
+entries = []
+seen_ids = set()
+for d in search_dirs:
+    if not os.path.isdir(d):
+        continue
+    for fp in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+        did = os.path.basename(fp)
+        if did in seen_ids:
+            continue
+        parsed = parse_desktop(fp)
+        if parsed:
+            seen_ids.add(did)
+            entries.append(parsed)
+
+matched = None
+# Pass 1: Exact Name= match
+for e in entries:
+    if e["name"].lower() == q_lower:
+        matched = e
+        break
+
+# Pass 2: Exact .desktop filename match
+if not matched:
+    q_did = q_lower if q_lower.endswith(".desktop") else f"{q_lower}.desktop"
+    for e in entries:
+        if e["desktop_id"].lower() == q_did:
+            matched = e
+            break
+
+# Pass 3: Exec command match
+if not matched:
+    for e in entries:
+        base_cmd, _, fp_id = extract_exec_details(e["exec_raw"])
+        if base_cmd.lower() == q_lower or (fp_id and fp_id.lower() == q_lower):
+            matched = e
+            break
+
+if matched:
+    base_cmd, bin_path, fp_id = extract_exec_details(matched["exec_raw"])
+    print(json.dumps({
+        "name": matched["name"] or query,
+        "desktop_id": matched["desktop_id"],
+        "exec_cmd": base_cmd,
+        "binary_path": bin_path,
+        "flatpak_id": fp_id
+    }))
+    sys.exit(0)
+
+# Fallback: Direct binary or Flatpak ID without .desktop file
+bin_path = ""
+if os.path.isabs(query) and os.path.exists(query):
+    bin_path = os.path.realpath(query)
+else:
+    found = shutil.which(query)
+    if found:
+        bin_path = os.path.realpath(found)
+
+flatpak_id = query if (query.count(".") >= 2 and "/" not in query and not bin_path) else ""
+
+print(json.dumps({
+    "name": query,
+    "desktop_id": "",
+    "exec_cmd": os.path.basename(bin_path) if bin_path else query,
+    "binary_path": bin_path,
+    "flatpak_id": flatpak_id
+}))
+' "$query" "$user_home"
+}
+
+# ------------------------------------------------------------------------------
+# Hide or Restore .desktop Entries in Menu & ~/Desktop
+# ------------------------------------------------------------------------------
+hide_desktop_artifacts() {
+    local r_user="$1"
+    local user_home="$2"
+    local desktop_id="$3"
+    local app_name="$4"
+
+    local user_apps_dir="${user_home}/.local/share/applications"
+    local desktop_dir="${user_home}/Desktop"
+    local quarantine_dir="${PC_DESKTOP_QUARANTINE_BASE}/${r_user}"
+
+    # 1. Hide in Cinnamon Application Menu via root-owned override
+    if [[ -n "$desktop_id" ]]; then
+        mkdir -p "$user_apps_dir"
+        local override_file="${user_apps_dir}/${desktop_id}"
+        cat << EOF > "$override_file"
+# Managed by ParentControl (pc-apps.sh) - DO NOT EDIT
+[Desktop Entry]
+Type=Application
+Name=${app_name}
+Hidden=true
+NoDisplay=true
+EOF
+        chown root:root "$override_file"
+        chmod 0644 "$override_file"
+    fi
+
+    # 2. Quarantine any matching shortcut on ~/Desktop so user sees no dead icon
+    if [[ -d "$desktop_dir" ]]; then
+        mkdir -p "$quarantine_dir"
+        chown root:root "$quarantine_dir"
+        chmod 0700 "$quarantine_dir"
+
+        shopt -s nullglob
+        for desk_file in "${desktop_dir}"/*.desktop; do
+            local base_desk
+            base_desk="$(basename "$desk_file")"
+            local is_match=0
+            if [[ -n "$desktop_id" && "$base_desk" == "$desktop_id" ]]; then
+                is_match=1
+            elif [[ -n "$app_name" ]] && grep -qi "^Name=${app_name}$" "$desk_file" 2>/dev/null; then
+                is_match=1
+            fi
+            if [[ "$is_match" -eq 1 ]]; then
+                mv -f "$desk_file" "${quarantine_dir}/${base_desk}"
+                chown root:root "${quarantine_dir}/${base_desk}"
+                chmod 0644 "${quarantine_dir}/${base_desk}"
+            fi
+        done
+        shopt -u nullglob
+    fi
+}
+
+restore_desktop_artifacts() {
+    local r_user="$1"
+    local user_home="$2"
+    local desktop_id="$3"
+    local app_name="$4"
+
+    local r_group
+    r_group="$(id -gn "$r_user")"
+    local user_apps_dir="${user_home}/.local/share/applications"
+    local desktop_dir="${user_home}/Desktop"
+    local quarantine_dir="${PC_DESKTOP_QUARANTINE_BASE}/${r_user}"
+
+    # 1. Remove root-owned menu override if managed by ParentControl
+    if [[ -n "$desktop_id" ]]; then
+        local override_file="${user_apps_dir}/${desktop_id}"
+        if [[ -f "$override_file" ]] && grep -q "Managed by ParentControl" "$override_file" 2>/dev/null; then
+            rm -f "$override_file"
+        fi
+    fi
+
+    # 2. Restore any quarantined shortcut back to ~/Desktop
+    if [[ -d "$quarantine_dir" && -d "$desktop_dir" ]]; then
+        shopt -s nullglob
+        for q_file in "${quarantine_dir}"/*.desktop; do
+            local base_q
+            base_q="$(basename "$q_file")"
+            local is_match=0
+            if [[ -n "$desktop_id" && "$base_q" == "$desktop_id" ]]; then
+                is_match=1
+            elif [[ -n "$app_name" ]] && grep -qi "^Name=${app_name}$" "$q_file" 2>/dev/null; then
+                is_match=1
+            fi
+            if [[ "$is_match" -eq 1 ]]; then
+                mv -f "$q_file" "${desktop_dir}/${base_q}"
+                chown "${r_user}:${r_group}" "${desktop_dir}/${base_q}"
+                chmod 0755 "${desktop_dir}/${base_q}"
+            fi
+        done
+        shopt -u nullglob
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Enforce All Application Rules & Installer Locks
+# ------------------------------------------------------------------------------
+enforce_app_rules() {
+    local r_user="$1"
+    local user_home
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    ensure_acl_tool
+    pc_ensure_config_exists
+
+    local rules_dump
+    rules_dump="$(python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+apps_cfg = cfg.get("apps", {})
+lock_inst = "1" if apps_cfg.get("lock_installers", False) else "0"
+print(f"LOCK|{lock_inst}")
+
+for r in apps_cfg.get("rules", []):
+    status = str(r.get("status", "allow")).lower()
+    name = str(r.get("name", r.get("app", ""))).replace("|", " ")
+    did = str(r.get("desktop_id", "")).replace("|", "")
+    bpath = str(r.get("binary_path", "")).replace("|", "")
+    fpid = str(r.get("flatpak_id", "")).replace("|", "")
+    print(f"RULE|{status}|{name}|{did}|{bpath}|{fpid}")
+' "$PC_CONFIG_FILE")"
+
+    local lock_installers="0"
+    while IFS='|' read -r rec_type f1 f2 f3 f4 f5; do
+        if [[ "$rec_type" == "LOCK" ]]; then
+            lock_installers="$f1"
+            continue
+        fi
+        [[ "$rec_type" != "RULE" ]] && continue
+
+        local status="$f1"
+        local app_name="$f2"
+        local desktop_id="$f3"
+        local bin_path="$f4"
+        local flatpak_id="$f5"
+
+        if [[ "$status" == "block" ]]; then
+            if [[ -n "$flatpak_id" ]]; then
+                for fp_dir in "/var/lib/flatpak/app/${flatpak_id}" "${user_home}/.local/share/flatpak/app/${flatpak_id}"; do
+                    [[ -d "$fp_dir" ]] && setfacl -R -m "u:${r_user}:---" "$fp_dir" 2>/dev/null || true
+                done
+            elif [[ -n "$bin_path" && -e "$bin_path" ]] && ! is_protected_binary "$bin_path"; then
+                setfacl -m "u:${r_user}:---" "$bin_path" 2>/dev/null || true
+            fi
+            hide_desktop_artifacts "$r_user" "$user_home" "$desktop_id" "$app_name"
+        else
+            if [[ -n "$flatpak_id" ]]; then
+                for fp_dir in "/var/lib/flatpak/app/${flatpak_id}" "${user_home}/.local/share/flatpak/app/${flatpak_id}"; do
+                    [[ -d "$fp_dir" ]] && setfacl -R -x "u:${r_user}" "$fp_dir" 2>/dev/null || true
+                done
+            elif [[ -n "$bin_path" && -e "$bin_path" ]]; then
+                setfacl -x "u:${r_user}" "$bin_path" 2>/dev/null || true
+            fi
+            restore_desktop_artifacts "$r_user" "$user_home" "$desktop_id" "$app_name"
+        fi
+    done <<< "$rules_dump"
+
+    # Enforce or release Software Manager / Package Manager lock
+    local installer_bins=(
+        "/usr/bin/mintinstall"
+        "/usr/bin/flatpak"
+        "/usr/bin/snap"
+        "/usr/bin/apt"
+        "/usr/bin/apt-get"
+        "/usr/bin/dpkg"
+        "/usr/bin/gdebi"
+        "/usr/bin/gdebi-gtk"
+        "/usr/bin/synaptic"
+        "/usr/bin/synaptic-pkexec"
+    )
+    local installer_desktops=("mintinstall.desktop" "synaptic.desktop")
+
+    if [[ "$lock_installers" == "1" ]]; then
+        for ibin in "${installer_bins[@]}"; do
+            [[ -e "$ibin" ]] && setfacl -m "u:${r_user}:---" "$ibin" 2>/dev/null || true
+        done
+        for idesk in "${installer_desktops[@]}"; do
+            hide_desktop_artifacts "$r_user" "$user_home" "$idesk" ""
+        done
+    else
+        for ibin in "${installer_bins[@]}"; do
+            [[ -e "$ibin" ]] && setfacl -x "u:${r_user}" "$ibin" 2>/dev/null || true
+        done
+        for idesk in "${installer_desktops[@]}"; do
+            restore_desktop_artifacts "$r_user" "$user_home" "$idesk" ""
+        done
+    fi
+
+    pc_log "INFO" "Enforced application rules and installer lock (lock_installers=${lock_installers}) for '${r_user}'."
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Apps State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_apps_state_json() {
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+apps_cfg = cfg.get("apps", {})
+print(json.dumps({
+    "restricted_user": cfg.get("restricted_user", ""),
+    "lock_installers": bool(apps_cfg.get("lock_installers", False)),
+    "rules": apps_cfg.get("rules", [])
+}))
+' "$PC_CONFIG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+set_app_rule_status() {
+    local target_status="$1" # "block" or "allow"
+
+    if [[ -z "$TARGET_APP" ]]; then
+        pc_emit_error "Missing required --app <name|desktop|binary> flag." 2
+        exit 2
+    fi
+
+    local r_user user_home
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    local meta_json bin_path
+    meta_json="$(resolve_app_metadata "$TARGET_APP" "$user_home")"
+    bin_path="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("binary_path", ""))' "$meta_json")"
+
+    if [[ "$target_status" == "block" ]] && is_protected_binary "$bin_path"; then
+        pc_emit_error "Refusing to block protected core system binary: '${bin_path}'" 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg resolved_name
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    resolved_name="$(python3 -c '
+import json, sys
+
+cfg_path, raw_query, meta_str, new_status, out_path = sys.argv[1:6]
+meta = json.loads(meta_str)
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+apps_cfg = data.setdefault("apps", {"lock_installers": False, "rules": []})
+rules = apps_cfg.get("rules", [])
+
+name = meta.get("name") or raw_query
+desktop_id = meta.get("desktop_id", "")
+binary_path = meta.get("binary_path", "")
+flatpak_id = meta.get("flatpak_id", "")
+
+filtered = []
+for r in rules:
+    if r.get("name", "").lower() == name.lower():
+        continue
+    if desktop_id and r.get("desktop_id", "").lower() == desktop_id.lower():
+        continue
+    if binary_path and r.get("binary_path", "") == binary_path:
+        continue
+    if flatpak_id and r.get("flatpak_id", "").lower() == flatpak_id.lower():
+        continue
+    filtered.append(r)
+
+filtered.append({
+    "app": raw_query,
+    "name": name,
+    "desktop_id": desktop_id,
+    "binary_path": binary_path,
+    "flatpak_id": flatpak_id,
+    "status": new_status
+})
+filtered.sort(key=lambda x: x.get("name", "").lower())
+apps_cfg["rules"] = filtered
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(name)
+' "$PC_CONFIG_FILE" "$TARGET_APP" "$meta_json" "$target_status" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    enforce_app_rules "$r_user"
+    pc_commit_transaction
+
+    local verb="Blocked"
+    [[ "$target_status" == "allow" ]] && verb="Allowed"
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "${verb} application '${resolved_name}' for '${r_user}'" "$state_json"
+}
+
+handle_remove() {
+    if [[ -z "$TARGET_APP" ]]; then
+        pc_emit_error "Action 'remove' requires --app <name|desktop|binary>." 2
+        exit 2
+    fi
+
+    local r_user user_home
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+
+    local meta_json
+    meta_json="$(resolve_app_metadata "$TARGET_APP" "$user_home")"
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg removed_info
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_info="$(python3 -c '
+import json, sys
+
+cfg_path, raw_query, meta_str, out_path = sys.argv[1:5]
+meta = json.loads(meta_str)
+q_low = raw_query.strip().lower()
+m_name = meta.get("name", "").lower()
+m_did = meta.get("desktop_id", "").lower()
+m_bin = meta.get("binary_path", "")
+m_fp = meta.get("flatpak_id", "").lower()
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+apps_cfg = data.setdefault("apps", {"lock_installers": False, "rules": []})
+old_rules = apps_cfg.get("rules", [])
+
+kept = []
+removed = []
+for r in old_rules:
+    r_app = str(r.get("app", "")).lower()
+    r_name = str(r.get("name", "")).lower()
+    r_did = str(r.get("desktop_id", "")).lower()
+    r_bin = str(r.get("binary_path", ""))
+    r_fp = str(r.get("flatpak_id", "")).lower()
+
+    if (q_low in (r_app, r_name, r_did, r_fp) or
+        (m_name and r_name == m_name) or
+        (m_did and r_did == m_did) or
+        (m_bin and r_bin == m_bin) or
+        (m_fp and r_fp == m_fp)):
+        removed.append(r)
+    else:
+        kept.append(r)
+
+apps_cfg["rules"] = kept
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(json.dumps(removed))
+' "$PC_CONFIG_FILE" "$TARGET_APP" "$meta_json" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    local removed_count
+    removed_count="$(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$removed_info")"
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No saved application rule found for '${TARGET_APP}'." 2
+        exit 2
+    fi
+
+# Clean up ACLs and desktop artifacts for each removed rule
+    local cleanup_lines
+    cleanup_lines="$(python3 -c '
+import json, sys
+for r in json.loads(sys.argv[1]):
+    vals = [r.get("name", ""), r.get("desktop_id", ""), r.get("binary_path", ""), r.get("flatpak_id", "")]
+    print("|".join(vals))
+' "$removed_info")"
+
+    while IFS='|' read -r c_name c_did c_bin c_fp; do
+        if [[ -n "$c_fp" ]]; then
+            for fp_dir in "/var/lib/flatpak/app/${c_fp}" "${user_home}/.local/share/flatpak/app/${c_fp}"; do
+                [[ -d "$fp_dir" ]] && setfacl -R -x "u:${r_user}" "$fp_dir" 2>/dev/null || true
+            done
+        elif [[ -n "$c_bin" && -e "$c_bin" ]]; then
+            setfacl -x "u:${r_user}" "$c_bin" 2>/dev/null || true
+        fi
+        restore_desktop_artifacts "$r_user" "$user_home" "$c_did" "$c_name"
+    done <<< "$cleanup_lines"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Removed application rule for '${TARGET_APP}'" "$state_json"
+}
+
+handle_lock_installers() {
+    if [[ "$LOCK_ENABLED" != "true" && "$LOCK_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'lock-installers' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    local r_user
+    r_user="$(get_restricted_user)"
+
+    pc_init_transaction
+    pc_json_set "apps.lock_installers" "$LOCK_ENABLED"
+    enforce_app_rules "$r_user"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Set Software Manager / package installer lock to ${LOCK_ENABLED}" "$state_json"
+}
+
+handle_uninstall() {
+    if [[ -z "$TARGET_APP" ]]; then
+        pc_emit_error "Action 'uninstall' requires --app <name|desktop|binary|package>." 2
+        exit 2
+    fi
+
+    local r_user user_home meta_json bin_path flatpak_id
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+    meta_json="$(resolve_app_metadata "$TARGET_APP" "$user_home")"
+
+    bin_path="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("binary_path", ""))' "$meta_json")"
+    flatpak_id="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("flatpak_id", ""))' "$meta_json")"
+
+    if [[ -n "$flatpak_id" ]] && command -v flatpak >/dev/null 2>&1; then
+        pc_log "INFO" "Uninstalling Flatpak application '${flatpak_id}'..."
+        flatpak uninstall -y --noninteractive "$flatpak_id" >/dev/null
+        local state_json
+        state_json="$(build_apps_state_json)"
+        pc_emit_result "Uninstalled Flatpak package '${flatpak_id}'" "$state_json"
+        return 0
+    fi
+
+    local pkg_name=""
+    if [[ -n "$bin_path" && -e "$bin_path" ]]; then
+        pkg_name="$(dpkg-query -S "$bin_path" 2>/dev/null | head -n 1 | cut -d: -f1 || true)"
+    fi
+    if [[ -z "$pkg_name" ]] && dpkg-query -W -f='${Status}\n' "$TARGET_APP" 2>/dev/null | grep -q "install ok installed"; then
+        pkg_name="$TARGET_APP"
+    fi
+
+    if [[ -z "$pkg_name" ]]; then
+        pc_emit_error "Could not map '${TARGET_APP}' to an installed APT or Flatpak package." 2
+        exit 2
+    fi
+
+    # Guard critical Linux Mint / Cinnamon system packages
+    case "$pkg_name" in
+        mint-meta-*|mintsystem|mintdesktop|cinnamon*|lightdm*|slick-greeter|\
+        systemd*|xorg*|xserver-*|ubuntu-minimal|bash|coreutils|dpkg|apt|\
+        python3|python3-minimal|sudo|policykit-1|polkitd|acl|ufw)
+            pc_emit_error "Refusing to uninstall protected system package: '${pkg_name}'" 2
+            exit 2
+            ;;
+    esac
+
+    pc_log "INFO" "Uninstalling APT package '${pkg_name}'..."
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq "$pkg_name" >/dev/null
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Uninstalled APT package '${pkg_name}'" "$state_json"
+}
+
+handle_scan() {
+    pc_ensure_config_exists
+    python3 -c '
+import glob, json, os, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+rules_by_name = {}
+rules_by_did = {}
+for r in cfg.get("apps", {}).get("rules", []):
+    st = r.get("status", "allow")
+    if r.get("name"):
+        rules_by_name[r["name"].lower()] = st
+    if r.get("desktop_id"):
+        rules_by_did[r["desktop_id"].lower()] = st
+
+apps = {}
+for d in ("/usr/share/applications", "/usr/local/share/applications", "/var/lib/flatpak/exports/share/applications"):
+    if not os.path.isdir(d):
+        continue
+    for fp in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+        did = os.path.basename(fp)
+        name = ""
+        exec_cmd = ""
+        no_display = False
+        try:
+            with open(fp, "r", encoding="utf-8", errors="replace") as df:
+                in_main = False
+                for line in df:
+                    s = line.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        in_main = (s == "[Desktop Entry]")
+                        continue
+                    if not in_main or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    if k == "Name" and not name:
+                        name = v.strip()
+                    elif k == "Exec" and not exec_cmd:
+                        exec_cmd = v.strip()
+                    elif k in ("NoDisplay", "Hidden") and v.strip().lower() == "true":
+                        no_display = True
+        except Exception:
+            continue
+        if not name or no_display:
+            continue
+        if name not in apps:
+            status = rules_by_did.get(did.lower()) or rules_by_name.get(name.lower()) or "allow"
+            apps[name] = {
+                "name": name,
+                "desktop_id": did,
+                "exec": exec_cmd,
+                "status": status
+            }
+
+sorted_apps = [apps[k] for k in sorted(apps.keys(), key=str.lower)]
+out = {
+    "status": "ok",
+    "module": "apps",
+    "action": "scan",
+    "message": f"Scanned {len(sorted_apps)} installed desktop applications",
+    "data": {"count": len(sorted_apps), "applications": sorted_apps}
+}
+print(json.dumps(out))
+' "$PC_CONFIG_FILE"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Retrieved application governance rules" "$state_json"
+}
+
+handle_apply() {
+    local r_user
+    r_user="$(get_restricted_user)"
+
+    pc_init_transaction
+    enforce_app_rules "$r_user"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_apps_state_json)"
+    pc_emit_result "Applied all application governance rules for '${r_user}'" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_apps_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$APPS_ACTION" in
+        block)
+            set_app_rule_status "block"
+            ;;
+        allow|unblock)
+            set_app_rule_status "allow"
+            ;;
+        set)
+            case "$TARGET_STATUS" in
+                block) set_app_rule_status "block" ;;
+                allow) set_app_rule_status "allow" ;;
+                *)
+                    pc_emit_error "Action 'set' requires --status <Allow|Block>." 2
+                    exit 2
+                    ;;
+            esac
+            ;;
+        remove)
+            handle_remove
+            ;;
+        lock-installers)
+            handle_lock_installers
+            ;;
+        uninstall)
+            handle_uninstall
+            ;;
+        scan)
+            handle_scan
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${APPS_ACTION}' (expected: block, allow, set, remove, lock-installers, uninstall, scan, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_APPS_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-apps.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-apps.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-queue.sh (Sub-Chunk 6.1)
+# ------------------------------------------------------------------------------
+deploy_pc_queue_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-queue.sh..."
+
+    cat << 'PC_QUEUE_SH_EOF' > /opt/parentcontrol/bin/pc-queue.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Approvals Queue & User Request Manager
+# File: /opt/parentcontrol/bin/pc-queue.sh
+#
+# Description:
+#   Manages restricted-user access requests (app unlocks, URL whitelists, file
+#   downloads). Unprivileged users can submit requests to the sticky-bit spool
+#   directory (/var/spool/parentcontrol/requests); root/admin actions ingest,
+#   approve (auto-applying the rule), deny, or remove items.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh queue --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     request --type <app|web|file|other> --target <value> [--user <name>] [--reason <text>] --json
+#     approve --id <req_id> | --target <value> --json
+#     deny    --id <req_id> | --target <value> --json
+#     remove  --id <req_id> | --target <value> --json
+#     list    --json
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="queue"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages the ParentControl approvals queue for app, web, and download requests."
+PC_SCRIPT_USAGE="pc-queue.sh --action <request|approve|deny|remove|list> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         request, approve, deny, remove, list
+      --id <req_id>           Request ID (e.g., req-20261114-123456)
+      --user <username>       Requesting user (defaults to current user)
+      --type <category>       app | web | file | other
+      --target <value>        Application name, URL/domain, or filename
+      --reason <text>         Optional note from the user"
+
+readonly PC_SPOOL_DIR="/var/spool/parentcontrol/requests"
+readonly PC_QUEUE_FILE="${PC_VAR_DIR}/queue.json"
+
+QUEUE_ACTION=""
+REQ_ID=""
+REQ_USER=""
+REQ_TYPE="app"
+REQ_TARGET=""
+REQ_REASON=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_queue_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                QUEUE_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --id)
+                REQ_ID="${2:-}"
+                shift 2
+                ;;
+            --user)
+                REQ_USER="${2:-}"
+                shift 2
+                ;;
+            --type)
+                REQ_TYPE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --target)
+                REQ_TARGET="${2:-}"
+                shift 2
+                ;;
+            --reason)
+                REQ_REASON="${2:-}"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-queue.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$QUEUE_ACTION" ]]; then
+        pc_emit_error "Missing required --action <request|approve|deny|remove|list>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$QUEUE_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Ensure Queue Store & Ingest Any New Spool Requests
+# ------------------------------------------------------------------------------
+ensure_queue_file() {
+    mkdir -p "$PC_VAR_DIR"
+    if [[ ! -f "$PC_QUEUE_FILE" ]]; then
+        printf '{"requests": []}\n' > "$PC_QUEUE_FILE"
+        chown root:root "$PC_QUEUE_FILE"
+        chmod 0640 "$PC_QUEUE_FILE"
+    fi
+}
+
+ingest_spool_requests() {
+    ensure_queue_file
+    [[ -d "$PC_SPOOL_DIR" ]] || return 0
+
+    python3 -c '
+import glob, json, os, sys
+
+spool_dir, queue_path = sys.argv[1:3]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+requests = data.setdefault("requests", [])
+existing_ids = {r.get("id") for r in requests}
+
+ingested = 0
+for fp in sorted(glob.glob(os.path.join(spool_dir, "req-*.json"))):
+    try:
+        with open(fp, "r", encoding="utf-8") as rf:
+            item = json.load(rf)
+        if isinstance(item, dict) and item.get("id") and item.get("target"):
+            if item["id"] not in existing_ids:
+                requests.append({
+                    "id": str(item["id"]),
+                    "user": str(item.get("user", "unknown")),
+                    "type": str(item.get("type", "Other")),
+                    "target": str(item["target"]),
+                    "reason": str(item.get("reason", "")),
+                    "status": "Pending",
+                    "created_at": str(item.get("created_at", ""))
+                })
+                existing_ids.add(item["id"])
+                ingested += 1
+        os.remove(fp)
+    except Exception:
+        # Remove malformed spool files so they do not stall ingestion
+        try:
+            os.remove(fp)
+        except Exception:
+            pass
+
+if ingested > 0:
+    tmp_path = queue_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as wf:
+        json.dump(data, wf, indent=2)
+        wf.write("\n")
+    os.chmod(tmp_path, 0o640)
+    os.replace(tmp_path, queue_path)
+' "$PC_SPOOL_DIR" "$PC_QUEUE_FILE"
+}
+
+build_queue_state_json() {
+    ingest_spool_requests
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+reqs = data.get("requests", [])
+pending_count = sum(1 for r in reqs if str(r.get("status", "")).lower() == "pending")
+print(json.dumps({
+    "count": len(reqs),
+    "pending_count": pending_count,
+    "requests": reqs
+}))
+' "$PC_QUEUE_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Unprivileged Action: Submit a New Request to Spool Dropbox
+# ------------------------------------------------------------------------------
+handle_request() {
+    if [[ -z "$REQ_TARGET" ]]; then
+        pc_emit_error "Action 'request' requires --target <app|url|file>." 2
+        exit 2
+    fi
+
+    if [[ ! -d "$PC_SPOOL_DIR" ]]; then
+        pc_emit_error "Request spool directory does not exist: ${PC_SPOOL_DIR}" 1
+        exit 1
+    fi
+
+    local submitter="$REQ_USER"
+    if [[ -z "$submitter" ]]; then
+        submitter="$(id -un)"
+    fi
+
+    local display_type
+    case "$REQ_TYPE" in
+        app|application) display_type="App Access" ;;
+        web|url|site|domain) display_type="Web Access" ;;
+        file|download) display_type="Download File" ;;
+        *) display_type="Other" ;;
+    esac
+
+    local created_json
+    created_json="$(python3 -c '
+import datetime, json, os, random, sys
+
+spool_dir, user, req_type, target, reason = sys.argv[1:6]
+now = datetime.datetime.now(datetime.timezone.utc)
+ts = now.strftime("%Y%m%d%H%M%S")
+req_id = f"req-{ts}-{random.randint(1000, 9999)}"
+payload = {
+    "id": req_id,
+    "user": user,
+    "type": req_type,
+    "target": target.strip(),
+    "reason": reason.strip(),
+    "status": "Pending",
+    "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")
+}
+out_file = os.path.join(spool_dir, f"{req_id}.json")
+with open(out_file, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2)
+    f.write("\n")
+os.chmod(out_file, 0o644)
+print(json.dumps(payload))
+' "$PC_SPOOL_DIR" "$submitter" "$display_type" "$REQ_TARGET" "$REQ_REASON")"
+
+    if [[ "${PC_JSON_OUTPUT:-${PC_OUTPUT_JSON:-0}}" -eq 1 ]]; then
+        printf '{"status": "ok", "module": "queue", "action": "request", "message": "Submitted approval request", "data": %s}\n' "$created_json"
+    else
+        printf '[OK] Submitted approval request for %s (%s)\n' "$REQ_TARGET" "$display_type"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Privileged Actions: Approve, Deny, Remove, List
+# ------------------------------------------------------------------------------
+update_request_decision() {
+    local new_status="$1" # "Approved" or "Denied"
+
+    if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
+        pc_emit_error "Action requires --id <req_id> or --target <target>." 2
+        exit 2
+    fi
+
+    ingest_spool_requests
+    pc_init_transaction
+    pc_backup_file "$PC_QUEUE_FILE"
+
+    local match_info
+    match_info="$(python3 -c '
+import json, os, sys
+
+queue_path, req_id, req_target, new_status = sys.argv[1:5]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+reqs = data.get("requests", [])
+matched = None
+for r in reversed(reqs):
+    if req_id and r.get("id") == req_id:
+        r["status"] = new_status
+        matched = r
+        break
+    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
+        if str(r.get("status", "")).lower() == "pending":
+            r["status"] = new_status
+            matched = r
+            break
+
+if not matched:
+    sys.exit(1)
+
+tmp_path = queue_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+    wf.write("\n")
+os.chmod(tmp_path, 0o640)
+os.replace(tmp_path, queue_path)
+
+print(json.dumps(matched))
+' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET" "$new_status" 2>/dev/null || true)"
+
+    if [[ -z "$match_info" ]]; then
+        pc_commit_transaction
+        pc_emit_error "No matching pending request found in approvals queue." 2
+        exit 2
+    fi
+
+    # Automatically enforce rule if Approved
+    if [[ "$new_status" == "Approved" ]]; then
+        local m_type m_target
+        m_type="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("type", ""))' "$match_info")"
+        m_target="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("target", ""))' "$match_info")"
+
+        if [[ "$m_type" == "App Access" && -x "${PC_BIN_DIR}/pc-apps.sh" ]]; then
+            "${PC_BIN_DIR}/pc-apps.sh" --action allow --app "$m_target" --json >/dev/null 2>&1 || true
+        elif [[ "$m_type" == "Web Access" && -x "${PC_BIN_DIR}/pc-net-acl.sh" ]]; then
+            "${PC_BIN_DIR}/pc-net-acl.sh" --action add --list whitelist --target "$m_target" --json >/dev/null 2>&1 || true
+        fi
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Marked request as ${new_status}" "$state_json"
+}
+
+handle_remove() {
+    if [[ -z "$REQ_ID" && -z "$REQ_TARGET" ]]; then
+        pc_emit_error "Action 'remove' requires --id <req_id> or --target <target>." 2
+        exit 2
+    fi
+
+    ingest_spool_requests
+    pc_init_transaction
+    pc_backup_file "$PC_QUEUE_FILE"
+
+    local removed_count
+    removed_count="$(python3 -c '
+import json, os, sys
+
+queue_path, req_id, req_target = sys.argv[1:4]
+with open(queue_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+old_reqs = data.get("requests", [])
+kept = []
+removed = 0
+for r in old_reqs:
+    if req_id and r.get("id") == req_id:
+        removed += 1
+        continue
+    if not req_id and req_target and r.get("target", "").lower() == req_target.strip().lower():
+        removed += 1
+        continue
+    kept.append(r)
+
+data["requests"] = kept
+tmp_path = queue_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+    wf.write("\n")
+os.chmod(tmp_path, 0o640)
+os.replace(tmp_path, queue_path)
+
+print(removed)
+' "$PC_QUEUE_FILE" "$REQ_ID" "$REQ_TARGET")"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No matching queue entry found to remove." 2
+        exit 2
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Removed ${removed_count} item(s) from approvals queue" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_queue_state_json)"
+    pc_emit_result "Retrieved approvals queue" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_queue_args "$@"
+
+    if [[ "$QUEUE_ACTION" == "request" ]]; then
+        handle_request
+        exit 0
+    fi
+
+    pc_require_root
+    pc_verify_mint
+
+    case "$QUEUE_ACTION" in
+        approve)
+            update_request_decision "Approved"
+            ;;
+        deny)
+            update_request_decision "Denied"
+            ;;
+        remove)
+            handle_remove
+            ;;
+        list)
+            handle_list
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${QUEUE_ACTION}' (expected: request, approve, deny, remove, list)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_QUEUE_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-queue.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-queue.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-maint.sh (Sub-Chunk 6.2)
+# ------------------------------------------------------------------------------
+deploy_pc_maint_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-maint.sh..."
+
+    cat << 'PC_MAINT_SH_EOF' > /opt/parentcontrol/bin/pc-maint.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Automation, Screen-Time Limits & Maintenance Manager
+# File: /opt/parentcontrol/bin/pc-maint.sh
+#
+# Description:
+#   Manages daily screen-time limits (with systemd timer enforcement and
+#   session locking), automated APT security updates, Timeshift snapshots,
+#   Trash auto-purging, and the Senior/Dementia accessibility preset.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh maint --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     time-limit    --hours <0.5..24.0> [--enabled <true|false>] --json
+#     check-time    --json
+#     set-auto      --feature <auto_updates|auto_timeshift|auto_trash_purge> --enabled <true|false> --json
+#     senior-preset --enabled <true|false> --json
+#     run-now       --json
+#     list          --json
+#     apply         --json
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="maint"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages daily screen-time limits, automated maintenance tasks, and senior presets."
+PC_SCRIPT_USAGE="pc-maint.sh --action <time-limit|check-time|set-auto|senior-preset|run-now|list|apply> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         time-limit, check-time, set-auto, senior-preset, run-now, list, apply
+      --hours <float>         Daily screen-time limit in hours (0.5 to 24.0)
+      --feature <name>        auto_updates | auto_timeshift | auto_trash_purge
+      --enabled <true|false>  Enable or disable the specified setting"
+
+readonly PC_TIMELIMIT_HELPER="/usr/local/bin/parentcontrol-timelimit-check"
+readonly PC_TIMELIMIT_SERVICE="/etc/systemd/system/parentcontrol-timelimit.service"
+readonly PC_TIMELIMIT_TIMER="/etc/systemd/system/parentcontrol-timelimit.timer"
+readonly PC_USAGE_DIR="${PC_VAR_DIR}/usage"
+
+MAINT_ACTION=""
+LIMIT_HOURS=""
+AUTO_FEATURE=""
+FEATURE_ENABLED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_maint_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                MAINT_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            --hours)
+                LIMIT_HOURS="${2:-}"
+                shift 2
+                ;;
+            --feature)
+                AUTO_FEATURE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+                shift 2
+                ;;
+            --enabled)
+                FEATURE_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-maint.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$MAINT_ACTION" ]]; then
+        pc_emit_error "Missing required --action <time-limit|check-time|set-auto|senior-preset|run-now|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$MAINT_ACTION"
+}
+
+get_restricted_user() {
+    pc_ensure_config_exists
+    local r_user
+    r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
+    if [[ -z "$r_user" ]]; then
+        pc_emit_error "No restricted_user configured in config.json." 2
+        exit 2
+    fi
+    printf '%s' "$r_user"
+}
+
+# ------------------------------------------------------------------------------
+# Install / Configure Screen-Time Watcher & Systemd Timer
+# ------------------------------------------------------------------------------
+install_timelimit_units() {
+    mkdir -p "$PC_USAGE_DIR"
+    chown root:root "$PC_USAGE_DIR"
+    chmod 0750 "$PC_USAGE_DIR"
+
+    cat << 'HELPER_EOF' > "$PC_TIMELIMIT_HELPER"
+#!/usr/bin/env bash
+set -euo pipefail
+exec /opt/parentcontrol/bin/pc-maint.sh --action check-time --json >/dev/null
+HELPER_EOF
+    chown root:root "$PC_TIMELIMIT_HELPER"
+    chmod 0755 "$PC_TIMELIMIT_HELPER"
+
+    cat << 'SERVICE_EOF' > "$PC_TIMELIMIT_SERVICE"
+[Unit]
+Description=ParentControl Daily Screen-Time Enforcement Check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/parentcontrol-timelimit-check
+SERVICE_EOF
+
+    cat << 'TIMER_EOF' > "$PC_TIMELIMIT_TIMER"
+[Unit]
+Description=Run ParentControl Daily Screen-Time Check Every Minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=parentcontrol-timelimit.service
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF
+
+    chmod 0644 "$PC_TIMELIMIT_SERVICE" "$PC_TIMELIMIT_TIMER"
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+sync_timelimit_timer_state() {
+    pc_ensure_config_exists
+    local enabled
+    enabled="$(pc_json_get "automation.time_limit_enabled" 2>/dev/null || printf 'false')"
+
+    install_timelimit_units
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        if [[ "$enabled" == "true" ]]; then
+            systemctl enable --now parentcontrol-timelimit.timer >/dev/null 2>&1 || true
+        else
+            systemctl disable --now parentcontrol-timelimit.timer >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Evaluate & Enforce Today's Screen-Time Quota
+# ------------------------------------------------------------------------------
+evaluate_screen_time() {
+    pc_ensure_config_exists
+    mkdir -p "$PC_USAGE_DIR"
+
+    local r_user
+    r_user="$(get_restricted_user)"
+    local today_str
+    today_str="$(date +%Y-%m-%d)"
+    local usage_file="${PC_USAGE_DIR}/${today_str}.json"
+
+    # Check if restricted_user currently has an active graphical session
+    local is_active_session="0"
+    if command -v loginctl >/dev/null 2>&1; then
+        while read -r sid uid uname seat tty; do
+            [[ "$uname" == "$r_user" ]] || continue
+            local s_type s_state s_locked
+            s_type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+            s_state="$(loginctl show-session "$sid" -p State --value 2>/dev/null || true)"
+            s_locked="$(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null || true)"
+            if [[ "$s_type" =~ ^(x11|wayland)$ && "$s_state" == "active" && "$s_locked" != "yes" ]]; then
+                is_active_session="1"
+                break
+            fi
+        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+    fi
+
+    local eval_json
+    eval_json="$(python3 -c '
+import json, os, sys
+
+cfg_path, usage_path, r_user, active_flag = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+auto = cfg.get("automation", {})
+enabled = bool(auto.get("time_limit_enabled", False))
+limit_hours = float(auto.get("daily_limit_hours", 2.0))
+limit_minutes = max(1, int(round(limit_hours * 60)))
+
+usage = {"user": r_user, "used_minutes": 0}
+if os.path.isfile(usage_path):
+    try:
+        with open(usage_path, "r", encoding="utf-8") as uf:
+            usage = json.load(uf)
+    except Exception:
+        usage = {"user": r_user, "used_minutes": 0}
+
+used = int(usage.get("used_minutes", 0))
+if enabled and active_flag == "1":
+    used += 1
+    usage["used_minutes"] = used
+    with open(usage_path, "w", encoding="utf-8") as wf:
+        json.dump(usage, wf, indent=2)
+        wf.write("\n")
+
+remaining = max(0, limit_minutes - used)
+should_lock = enabled and (active_flag == "1") and (used >= limit_minutes)
+should_warn = enabled and (active_flag == "1") and (remaining == 5)
+
+print(json.dumps({
+    "enabled": enabled,
+    "limit_hours": limit_hours,
+    "limit_minutes": limit_minutes,
+    "used_minutes_today": used,
+    "remaining_minutes": remaining,
+    "active_session": active_flag == "1",
+    "should_warn": should_warn,
+    "should_lock": should_lock
+}))
+' "$PC_CONFIG_FILE" "$usage_file" "$r_user" "$is_active_session")"
+
+    local should_warn should_lock
+    should_warn="$(python3 -c 'import json, sys; print("1" if json.loads(sys.argv[1]).get("should_warn") else "0")' "$eval_json")"
+    should_lock="$(python3 -c 'import json, sys; print("1" if json.loads(sys.argv[1]).get("should_lock") else "0")' "$eval_json")"
+
+    if [[ "$should_warn" == "1" ]]; then
+        local r_uid
+        r_uid="$(id -u "$r_user")"
+        sudo -u "$r_user" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${r_uid}/bus" \
+            notify-send -u critical "ParentControl Screen Time" "5 minutes of daily screen time remaining." 2>/dev/null || true
+    fi
+
+    if [[ "$should_lock" == "1" ]] && command -v loginctl >/dev/null 2>&1; then
+        while read -r sid uid uname seat tty; do
+            if [[ "$uname" == "$r_user" ]]; then
+                loginctl lock-session "$sid" >/dev/null 2>&1 || true
+            fi
+        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+        pc_log "INFO" "Daily screen-time limit reached for '${r_user}'; locked active session."
+    fi
+
+    printf '%s' "$eval_json"
+}
+
+# ------------------------------------------------------------------------------
+# Automation Features & Senior Preset Enforcement
+# ------------------------------------------------------------------------------
+apply_auto_updates() {
+    local enabled="$1"
+    local val="0"
+    [[ "$enabled" == "true" ]] && val="1"
+
+    mkdir -p /etc/apt/apt.conf.d
+    cat << EOF > /etc/apt/apt.conf.d/20parentcontrol-auto-upgrades
+// Managed by ParentControl (pc-maint.sh)
+APT::Periodic::Update-Package-Lists "${val}";
+APT::Periodic::Unattended-Upgrade "${val}";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    chmod 0644 /etc/apt/apt.conf.d/20parentcontrol-auto-upgrades
+}
+
+apply_senior_preset() {
+    local enabled="$1"
+    local r_user r_uid
+    r_user="$(get_restricted_user)"
+    r_uid="$(id -u "$r_user")"
+
+    local bus_addr="unix:path=/run/user/${r_uid}/bus"
+    if [[ -S "/run/user/${r_uid}/bus" ]] && command -v gsettings >/dev/null 2>&1; then
+        if [[ "$enabled" == "true" ]]; then
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings set org.cinnamon.desktop.interface text-scaling-factor 1.25 2>/dev/null || true
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings set org.cinnamon hotcorner-layout "['scale:false:0', 'scale:false:0', 'desktop:false:0', 'desktop:false:0']" 2>/dev/null || true
+        else
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings reset org.cinnamon.desktop.interface text-scaling-factor 2>/dev/null || true
+            sudo -u "$r_user" DBUS_SESSION_BUS_ADDRESS="$bus_addr" \
+                gsettings reset org.cinnamon hotcorner-layout 2>/dev/null || true
+        fi
+    fi
+}
+
+purge_old_trash() {
+    local r_user user_home trash_files trash_info
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
+    trash_files="${user_home}/.local/share/Trash/files"
+    trash_info="${user_home}/.local/share/Trash/info"
+
+    [[ -d "$trash_files" ]] && find "$trash_files" -mindepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+    [[ -d "$trash_info" ]] && find "$trash_info" -mindepth 1 -mtime +7 -exec rm -f {} + 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Maintenance State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_maint_state_json() {
+    pc_ensure_config_exists
+    local today_str
+    today_str="$(date +%Y-%m-%d)"
+    local usage_file="${PC_USAGE_DIR}/${today_str}.json"
+
+    python3 -c '
+import json, os, sys
+
+cfg_path, usage_path = sys.argv[1:3]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+auto = cfg.get("automation", {})
+used = 0
+if os.path.isfile(usage_path):
+    try:
+        with open(usage_path, "r", encoding="utf-8") as uf:
+            used = int(json.load(uf).get("used_minutes", 0))
+    except Exception:
+        used = 0
+
+print(json.dumps({
+    "restricted_user": cfg.get("restricted_user", ""),
+    "time_limit_enabled": bool(auto.get("time_limit_enabled", False)),
+    "daily_limit_hours": float(auto.get("daily_limit_hours", 2.0)),
+    "used_minutes_today": used,
+    "auto_updates": bool(auto.get("auto_updates", False)),
+    "auto_timeshift": bool(auto.get("auto_timeshift", False)),
+    "auto_trash_purge": bool(auto.get("auto_trash_purge", False)),
+    "senior_preset": bool(auto.get("senior_preset", False))
+}))
+' "$PC_CONFIG_FILE" "$usage_file"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_time_limit() {
+    if [[ -z "$LIMIT_HOURS" ]]; then
+        pc_emit_error "Action 'time-limit' requires --hours <0.5..24.0>." 2
+        exit 2
+    fi
+
+    local valid_hours
+    if ! valid_hours="$(python3 -c '
+import sys
+try:
+    h = float(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+if h < 0.5 or h > 24.0:
+    sys.exit(1)
+print(round(h, 2))
+' "$LIMIT_HOURS")"; then
+        pc_emit_error "Invalid --hours '${LIMIT_HOURS}'. Must be between 0.5 and 24.0." 2
+        exit 2
+    fi
+
+    local enabled_flag="true"
+    if [[ "$FEATURE_ENABLED" == "false" ]]; then
+        enabled_flag="false"
+    fi
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, hours_val, enabled_str, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+auto = data.setdefault("automation", {})
+auto["daily_limit_hours"] = hours_val
+auto["time_limit_enabled"] = (enabled_str == "true")
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$valid_hours" "$enabled_flag" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    sync_timelimit_timer_state
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Set daily screen-time limit to ${valid_hours} hours (enabled=${enabled_flag})" "$state_json"
+}
+
+handle_check_time() {
+    local eval_json
+    eval_json="$(evaluate_screen_time)"
+    pc_emit_result "Evaluated daily screen-time quota" "$eval_json"
+}
+
+handle_set_auto() {
+    case "$AUTO_FEATURE" in
+        auto_updates|auto_timeshift|auto_trash_purge)
+            ;;
+        *)
+            pc_emit_error "Invalid --feature '${AUTO_FEATURE}'. Must be auto_updates, auto_timeshift, or auto_trash_purge." 2
+            exit 2
+            ;;
+    esac
+
+    if [[ "$FEATURE_ENABLED" != "true" && "$FEATURE_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'set-auto' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_json_set "automation.${AUTO_FEATURE}" "$FEATURE_ENABLED"
+
+    if [[ "$AUTO_FEATURE" == "auto_updates" ]]; then
+        apply_auto_updates "$FEATURE_ENABLED"
+    elif [[ "$AUTO_FEATURE" == "auto_trash_purge" && "$FEATURE_ENABLED" == "true" ]]; then
+        purge_old_trash
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Set automation feature '${AUTO_FEATURE}' to ${FEATURE_ENABLED}" "$state_json"
+}
+
+handle_senior_preset() {
+    if [[ "$FEATURE_ENABLED" != "true" && "$FEATURE_ENABLED" != "false" ]]; then
+        pc_emit_error "Action 'senior-preset' requires --enabled <true|false>." 2
+        exit 2
+    fi
+
+    pc_init_transaction
+    pc_json_set "automation.senior_preset" "$FEATURE_ENABLED"
+    apply_senior_preset "$FEATURE_ENABLED"
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Set Senior/Dementia accessibility preset to ${FEATURE_ENABLED}" "$state_json"
+}
+
+handle_run_now() {
+    pc_ensure_config_exists
+    local ran_tasks=()
+
+    local do_trash do_timeshift
+    do_trash="$(pc_json_get "automation.auto_trash_purge" 2>/dev/null || printf 'false')"
+    do_timeshift="$(pc_json_get "automation.auto_timeshift" 2>/dev/null || printf 'false')"
+
+    if [[ "$do_trash" == "true" ]]; then
+        purge_old_trash
+        ran_tasks+=("trash_purge")
+    fi
+
+    if [[ "$do_timeshift" == "true" ]] && command -v timeshift >/dev/null 2>&1; then
+        timeshift --create --comments "ParentControl Automated Snapshot" >/dev/null 2>&1 || true
+        ran_tasks+=("timeshift_snapshot")
+    fi
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Completed immediate maintenance run (${ran_tasks[*]:-none_enabled})" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Retrieved automation and screen-time settings" "$state_json"
+}
+
+handle_apply() {
+    pc_ensure_config_exists
+    sync_timelimit_timer_state
+
+    local auto_up senior_on
+    auto_up="$(pc_json_get "automation.auto_updates" 2>/dev/null || printf 'false')"
+    senior_on="$(pc_json_get "automation.senior_preset" 2>/dev/null || printf 'false')"
+
+    apply_auto_updates "$auto_up"
+    apply_senior_preset "$senior_on"
+
+    local state_json
+    state_json="$(build_maint_state_json)"
+    pc_emit_result "Applied all automation and maintenance policies" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_maint_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$MAINT_ACTION" in
+        time-limit)
+            handle_time_limit
+            ;;
+        check-time)
+            handle_check_time
+            ;;
+        set-auto)
+            handle_set_auto
+            ;;
+        senior-preset)
+            handle_senior_preset
+            ;;
+        run-now)
+            handle_run_now
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${MAINT_ACTION}' (expected: time-limit, check-time, set-auto, senior-preset, run-now, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_MAINT_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-maint.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-maint.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy Initial Master Configuration (/etc/parentcontrol/config.json)
+# ------------------------------------------------------------------------------
+deploy_initial_config() {
+    log_step "Ensuring initial configuration exists at /etc/parentcontrol/config.json..."
+
+    bash -c '
+        source /opt/parentcontrol/lib/common.sh
+        pc_ensure_config_exists
+    '
+}
+
+# ------------------------------------------------------------------------------
+# Automated Verification Self-Test
+# ------------------------------------------------------------------------------
+run_self_test() {
+    log_step "Running automated verification self-test..."
+
+    local test_flags=(--json)
+    [[ "$VERBOSE" -eq 1 ]] && test_flags+=(--verbose)
+    [[ "$FORCE_OS" -eq 1 ]] && test_flags+=(--force-os)
+
+    /opt/parentcontrol/bin/pc-ctl.sh status --action check "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh config --action get --key browser "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh logs --action read --lines 5 "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh acl --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh perms --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh ports --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh devices --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh apps --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh queue --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh maint --action list "${test_flags[@]}"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+    preflight_checks
+    create_directories
+    deploy_defaults_conf
+    deploy_common_sh
+    deploy_pc_ctl_sh
+    deploy_pc_setup_sh
+    deploy_pc_net_acl_sh
+    deploy_pc_perms_sh
+    deploy_pc_ports_sh
+    deploy_pc_devices_sh
+    deploy_pc_apps_sh
+    deploy_pc_queue_sh
+    deploy_pc_maint_sh
+    deploy_initial_config
+
+    if [[ "$SKIP_TEST" -eq 0 ]]; then
+        run_self_test
+    else
+        printf '[OK] ParentControl Part 6 deployed (self-test skipped).\n'
+    fi
+}
+
+main "$@"
