@@ -1,0 +1,26 @@
+/* Settings page. Colors, buttons and type come from brand.css. */
+main { max-width: 800px; margin: 0 auto; padding: 24px 16px 64px; }
+.top { display: flex; align-items: center; gap: 16px; padding: 18px 20px; margin: 0 0 20px; border-radius: 20px; color: #fff; background: linear-gradient(120deg, #0d2c54, #1d4ed8); box-shadow: var(--shadow); }
+.top h1 { margin: 0; font-size: 1.5em; line-height: 1.2; }
+.top .tag { margin: 0; opacity: 0.85; font-size: 0.95em; }
+h2 { font-size: 1.2em; margin: 0 0 0.4em; }
+section, fieldset, details { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; margin: 0 0 18px; box-shadow: var(--shadow); }
+legend { font-weight: 800; padding: 0 8px; }
+label { display: block; margin: 12px 0 4px; font-weight: 700; }
+label.check { font-weight: 400; display: flex; gap: 10px; align-items: flex-start; }
+input[type=text], input[type=password], select, textarea { width: 100%; font: inherit; padding: 10px 12px; border: 2px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--fg); }
+textarea { font-family: ui-monospace, monospace; font-size: 0.95em; }
+input:focus, select:focus, textarea:focus, button:focus-visible { outline: 3px solid var(--accent-2); outline-offset: 2px; }
+button { font: inherit; font-weight: 700; padding: 10px 20px; margin-top: 12px; border-radius: 12px; border: 2px solid var(--accent); background: linear-gradient(180deg, var(--accent-2), var(--accent)); color: var(--accent-fg); cursor: pointer; box-shadow: 0 2px 0 rgba(0,0,0,.08); }
+button[type=button] { background: transparent; color: var(--accent); box-shadow: none; }
+button[disabled] { opacity: .6; cursor: default; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+.row input { flex: 1 1 260px; }
+.hint { font-size: 0.9em; color: var(--muted); }
+.notice { padding: 12px 16px; border-radius: 12px; border: 2px solid var(--line); background: var(--card); font-weight: 700; }
+.notice.bad { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
+.notice.ok { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
+table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+th, td { text-align: left; padding: 8px 6px; font-size: 0.95em; border-bottom: 1px solid var(--line); }
+td select { padding: 6px; }
+summary { cursor: pointer; font-weight: 800; }

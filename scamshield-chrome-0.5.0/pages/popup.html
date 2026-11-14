@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ScamShield</title>
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body data-level="neutral">
+  <main id="main">
+    <header class="brand">
+      <img src="../icons/icon-32.png" alt="" width="24" height="24"><span>ScamShield</span>
+      <a id="settings" href="options.html" target="_blank" rel="noopener" title="Settings" aria-label="Settings">&#9881;</a>
+    </header>
+
+    <section id="status" class="status" aria-live="polite">
+      <svg viewBox="0 0 64 64" class="shield-big" aria-hidden="true">
+        <path d="M32 3.5 57 12.5v18c0 15.6-10.4 27.1-25 30.5C17.4 57.6 7 46.1 7 30.5v-18z" class="body"/>
+        <path id="mark" class="mark" d="M20 32l8 8 16-17"/>
+      </svg>
+      <h1 id="title">&nbsp;</h1>
+      <p id="why"></p>
+      <p id="host" class="host"></p>
+      <ul id="reasons" class="reasons" hidden></ul>
+    </section>
+
+    <section class="numbers" aria-label="What ScamShield has done">
+      <div><b id="n-ads">0</b><span>ads blocked on this page</span></div>
+      <div><b id="n-sites">0</b><span>bad sites stopped</span></div>
+      <div><b id="n-scams">0</b><span>scam pages caught</span></div>
+      <div><b id="n-dl">0</b><span>downloads held</span></div>
+    </section>
+
+    <button id="panic" type="button" class="btn danger panic"></button>
+    <button id="ask" type="button" class="btn secondary" hidden></button>
+  </main>
+
+  <main id="steps" hidden>
+    <header class="brand"><img src="../icons/icon-32.png" alt="" width="24" height="24"><span>ScamShield</span></header>
+    <section class="status panic-done">
+      <svg viewBox="0 0 64 64" class="shield-big" aria-hidden="true"><path d="M32 3.5 57 12.5v18c0 15.6-10.4 27.1-25 30.5C17.4 57.6 7 46.1 7 30.5v-18z" class="body"/><path class="mark" d="M32 17v17M32 43.5v.5"/></svg>
+      <h1 id="steps-title"></h1>
+      <p id="steps-sent" role="status"></p>
+    </section>
+    <ol id="steps-list"></ol>
+    <p id="steps-call" class="callbox"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

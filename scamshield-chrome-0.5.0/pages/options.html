@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ScamShield settings</title>
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header class="top">
+      <img src="../icons/icon-48.png" alt="" width="48" height="48">
+      <div><h1>ScamShield settings</h1><p class="tag">Keeping your family safe online</p></div>
+    </header>
+    <p id="notice" class="notice" role="status" hidden></p>
+
+    <section id="managed" hidden>
+      <h2>Managed by policy</h2>
+      <p>These settings are controlled by the person who installed ScamShield on this computer, so they cannot be changed here.</p>
+    </section>
+
+    <section id="setup" hidden>
+      <h2>Create the admin passcode</h2>
+      <p>Only the person in charge of protection should do this. The passcode will be needed to change any setting. Write it down somewhere safe: it cannot be recovered.</p>
+      <form id="setup-form">
+        <label for="setup-pass">New passcode (at least 8 characters)</label>
+        <input id="setup-pass" type="password" autocomplete="new-password" minlength="8" required>
+        <label for="setup-pass2">Type it again</label>
+        <input id="setup-pass2" type="password" autocomplete="new-password" minlength="8" required>
+        <button type="submit">Create passcode</button>
+      </form>
+    </section>
+
+    <section id="unlock" hidden>
+      <h2>Enter the admin passcode</h2>
+      <form id="unlock-form">
+        <label for="unlock-pass">Passcode</label>
+        <input id="unlock-pass" type="password" autocomplete="current-password" required>
+        <button type="submit">Unlock settings</button>
+      </form>
+    </section>
+
+    <form id="editor" hidden>
+      <fieldset>
+        <legend>Who to call</legend>
+        <label for="admin-name">Admin name</label>
+        <input id="admin-name" type="text" maxlength="60" required>
+        <label for="admin-phone">Admin phone number</label>
+        <input id="admin-phone" type="text" maxlength="32" required>
+      </fieldset>
+
+      <fieldset>
+        <legend>Alerts to the admin (ntfy)</legend>
+        <label for="ntfy-server">Server</label>
+        <input id="ntfy-server" type="text" required>
+        <label for="ntfy-topic">Topic (a long random name; keep it private)</label>
+        <div class="row">
+          <input id="ntfy-topic" type="text" required>
+          <button type="button" id="make-topic">Make a random topic</button>
+        </div>
+        <label for="ntfy-token">Access token (optional, write-only; strongly recommended)</label>
+        <input id="ntfy-token" type="text" autocomplete="off" placeholder="tk_...">
+        <p class="hint">Without a write-only token, anyone who learns the topic can read the one-time codes. This computer's user can open this settings page only with the passcode, but the topic is stored in the browser.</p>
+        <button type="button" id="test-alert">Send a test message (saves first)</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>How firm to be</legend>
+        <label for="preset">Preset</label>
+        <select id="preset">
+          <option value="gentle">Gentle: reminders only</option>
+          <option value="standard">Standard: wait and think on new sites</option>
+          <option value="strict">Strict: admin code needed on new sites</option>
+          <option value="custom">Custom</option>
+        </select>
+        <table>
+          <thead><tr><th></th><th>Card entry</th><th>Password prompt</th><th>Downloads</th></tr></thead>
+          <tbody id="tiers"></tbody>
+        </table>
+        <label for="bank-policy">Bank logins</label>
+        <select id="bank-policy">
+          <option value="approve_once">Trusted once the bank is listed</option>
+          <option value="approve_every">Admin code for every login</option>
+          <option value="off">Treat banks like any other site</option>
+        </select>
+        <label class="check"><input id="scam-detection" type="checkbox"> Warn on pages that look like scams (fake virus alarms, gift-card or crypto demands)</label>
+        <label class="check"><input id="hold-all" type="checkbox"> Hold every download for approval (except from blocked sites)</label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Websites (one per line, like example.com)</legend>
+        <label for="list-whitelist">Trusted</label>
+        <textarea id="list-whitelist" rows="4"></textarea>
+        <label for="list-bank_domains">Banks</label>
+        <textarea id="list-bank_domains" rows="3"></textarea>
+        <label for="list-graylist">Watch closely (optional)</label>
+        <textarea id="list-graylist" rows="3"></textarea>
+        <label for="list-blacklist">Blocked (your own list)</label>
+        <textarea id="list-blacklist" rows="3"></textarea>
+        <p class="hint">This box holds only the sites you add. The automatic blocklists below are kept separately, because they contain tens of thousands of sites.</p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Automatic blocklists</legend>
+        <label class="check"><input id="feeds-enabled" type="checkbox"> Download and use public blocklists (malware, phishing, ads)</label>
+        <p class="hint">Your trusted and bank sites are never blocked by these lists, and your own lists always win.</p>
+        <table>
+          <thead><tr><th>List</th><th>Blocks</th><th>Sites</th><th>Updated</th><th>Status</th></tr></thead>
+          <tbody id="feeds"></tbody>
+        </table>
+        <button type="button" id="feeds-refresh">Update now</button>
+        <label for="check-site">Check a website</label>
+        <div class="row">
+          <input id="check-site" type="text" placeholder="example.com" autocomplete="off">
+          <button type="button" id="check-button">Check</button>
+        </div>
+        <p id="check-result" class="hint" role="status"></p>
+      </fieldset>
+
+      <div class="row">
+        <button type="submit" id="save">Save settings</button>
+        <button type="button" id="lock">Lock settings</button>
+      </div>
+
+      <details>
+        <summary>Change the passcode</summary>
+        <label for="old-pass">Current passcode</label>
+        <input id="old-pass" type="password" autocomplete="current-password">
+        <label for="new-pass">New passcode</label>
+        <input id="new-pass" type="password" autocomplete="new-password">
+        <button type="button" id="change-pass">Change passcode</button>
+      </details>
+
+      <details>
+        <summary>Advanced: settings as text</summary>
+        <p class="hint">The same format the installer uses. "Show" fills this from the form above; "Load" fills the form from this text (nothing is saved until you press Save).</p>
+        <textarea id="json" rows="12" spellcheck="false"></textarea>
+        <div class="row">
+          <button type="button" id="json-show">Show</button>
+          <button type="button" id="json-load">Load into form</button>
+        </div>
+      </details>
+    </form>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

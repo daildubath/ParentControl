@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ScamShield</title>
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="interstitial.css">
+</head>
+<body>
+  <main id="page" aria-live="polite">
+    <div class="card">
+      <div class="badge" aria-hidden="true">
+        <svg viewBox="0 0 64 64" class="big-shield">
+          <path d="M32 3.5 57 12.5v18c0 15.6-10.4 27.1-25 30.5C17.4 57.6 7 46.1 7 30.5v-18z" class="shield-body"/>
+          <g class="glyph glyph-stop"><path d="M32 17v17" /><circle cx="32" cy="43.5" r="1.2"/></g>
+          <g class="glyph glyph-lock"><rect x="21" y="30" width="22" height="15" rx="3" class="fill"/><path d="M25.5 30v-5a6.5 6.5 0 0 1 13 0v5" /></g>
+        </svg>
+      </div>
+      <h1 id="title"></h1>
+      <p id="body"></p>
+      <p id="contact" class="contact"></p>
+
+      <section id="pin-section" hidden>
+        <button id="send-code" type="button" class="btn"></button>
+        <form id="pin-form" hidden autocomplete="off">
+          <label for="pin-input" id="pin-label"></label>
+          <div class="pin-row">
+            <input id="pin-input" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" required>
+            <button id="submit" type="submit" class="btn"></button>
+          </div>
+        </form>
+      </section>
+
+      <p id="status" role="status"></p>
+      <div class="actions">
+        <button id="continue" type="button" class="btn" hidden></button>
+        <button id="back" type="button" class="btn secondary"></button>
+      </div>
+    </div>
+  </main>
+  <script src="interstitial.js"></script>
+</body>
+</html>

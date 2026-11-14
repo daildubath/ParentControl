@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Computer Repair</title><link rel="stylesheet" href="demo.css"></head>
+<body>
+<div class="training">TRAINING DEMO: this is a pretend scam page. Nothing here is real. <a href="index.html">Back to all demos</a></div>
+<main>
+<div class="fake blue">
+<h2>Your PC has been locked</h2>
+<p>Our technician needs to connect to your computer. Please download AnyDesk and allow remote access so we can fix the problem.</p>
+<p>Call 1-855-555-0123 if you need help. Act now to avoid data loss.</p>
+<p><a class="dl" id="dl" href="#">Download AnyDesk-setup.exe (pretend, harmless)</a></p>
+<p id="msg"></p>
+</div>
+<script>
+document.getElementById("dl").addEventListener("click", (e) => {
+  e.preventDefault();
+  const blob = new Blob(["This is a harmless pretend file from the ScamShield simulator.\n"], { type: "application/octet-stream" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "AnyDesk-setup.exe";
+  document.body.append(a); a.click(); a.remove();
+  document.getElementById("msg").textContent = "Download started (ScamShield should hold it for approval).";
+});
+</script>
+</main>
+</body></html>

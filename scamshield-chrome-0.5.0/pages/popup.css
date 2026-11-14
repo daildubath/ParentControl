@@ -1,0 +1,32 @@
+/* Toolbar popup: one glance tells you if this page is OK. */
+body { width: 340px; font-size: 15px; min-height: 380px; margin: 0; --tone: var(--muted); --tone-bg: var(--bg-2); }
+body[data-level="safe"] { --tone: var(--ok); --tone-bg: var(--ok-bg); }
+body[data-level="careful"] { --tone: var(--warn); --tone-bg: var(--warn-bg); }
+body[data-level="danger"] { --tone: var(--bad); --tone-bg: var(--bad-bg); }
+main { padding: 12px 14px 16px; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 800; padding-bottom: 8px; }
+.brand span { flex: 1; }
+.brand a { text-decoration: none; font-size: 1.3em; color: var(--muted); padding: 2px 6px; border-radius: 8px; }
+.brand a:hover { background: var(--bg-2); }
+.status { text-align: center; padding: 14px 12px 12px; border-radius: 18px; background: var(--tone-bg); border: 2px solid var(--tone); }
+.shield-big { width: 3.6em; height: 3.6em; filter: drop-shadow(0 4px 6px rgba(16, 32, 56, .22)); }
+.shield-big .body { fill: var(--tone); }
+.shield-big .mark { fill: none; stroke: #fff; stroke-width: 6; stroke-linecap: round; stroke-linejoin: round; }
+body[data-level="danger"] #mark { d: path("M32 17v17M32 43.5v.5"); }
+body[data-level="careful"] #mark { d: path("M32 17v17M32 43.5v.5"); }
+body[data-level="neutral"] #mark { d: path("M22 32h20"); }
+.status h1 { margin: .2em 0 .2em; font-size: 1.35em; color: var(--tone); line-height: 1.2; }
+.status p { margin: 0 0 .3em; font-size: .95em; }
+.host { font-weight: 800; word-break: break-all; font-size: .85em; opacity: .8; }
+.reasons { list-style: none; margin: .5em 0 0; padding: 0; text-align: left; font-size: .88em; }
+.reasons li { padding: .25em .6em .25em 1.5em; position: relative; }
+.reasons li::before { content: "!"; position: absolute; left: .5em; font-weight: 900; color: var(--tone); }
+.numbers { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+.numbers div { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 8px 10px; box-shadow: var(--shadow); }
+.numbers b { display: block; font-size: 1.6em; line-height: 1.1; color: var(--accent); }
+.numbers span { font-size: .78em; color: var(--muted); }
+.panic { width: 100%; font-size: 1.05em; min-height: 3.2em; }
+#ask { width: 100%; margin-top: 8px; }
+ol { padding-left: 1.4em; margin: 12px 0; font-size: 1.02em; }
+ol li { margin: .5em 0; font-weight: 600; }
+.callbox { background: var(--warn-bg); color: var(--warn); font-weight: 800; border-radius: 12px; padding: .6em .9em; }
