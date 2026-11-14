@@ -2667,6 +2667,787 @@ PC_PERMS_SH_EOF
     chmod 0755 /opt/parentcontrol/bin/pc-perms.sh
 }
 
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-ports.sh (Sub-Chunk 4.1)
+# ------------------------------------------------------------------------------
+deploy_pc_ports_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-ports.sh..."
+
+    cat << 'PC_PORTS_SH_EOF' > /opt/parentcontrol/bin/pc-ports.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Network Port & UFW Firewall Manager
+# File: /opt/parentcontrol/bin/pc-ports.sh
+#
+# Description:
+#   Manages blocked TCP/UDP ports in config.json and enforces inbound/outbound
+#   port rules via Uncomplicated Firewall (ufw) on Linux Mint 22.3.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh ports --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     block   --port <1-65535> [--protocol <TCP|UDP|BOTH>] --json   (alias: add)
+#     unblock --port <1-65535> [--protocol <TCP|UDP|BOTH>] --json   (alias: remove)
+#     list    --json
+#     apply   --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "ufw_active": true,
+#       "blocked_ports": [
+#         {"port": 6667, "protocol": "TCP"}
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="ports"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages blocked network ports via UFW firewall rules."
+PC_SCRIPT_USAGE="pc-ports.sh --action <block|unblock|list|apply> [--port <1-65535>] [--protocol <TCP|UDP|BOTH>] [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         block (add), unblock (remove), list, apply
+      --port <number>         TCP/UDP port number (1-65535)
+      --protocol <proto>      TCP, UDP, or BOTH (default: BOTH)"
+
+PORTS_ACTION=""
+TARGET_PORT=""
+TARGET_PROTO="BOTH"
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_ports_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                PORTS_ACTION="${2:-}"
+                shift 2
+                ;;
+            --port)
+                TARGET_PORT="${2:-}"
+                shift 2
+                ;;
+            --protocol)
+                TARGET_PROTO="$(printf '%s' "${2:-}" | tr '[:lower:]' '[:upper:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-ports.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$PORTS_ACTION" ]]; then
+        pc_emit_error "Missing required --action <block|unblock|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$PORTS_ACTION"
+}
+
+# ------------------------------------------------------------------------------
+# Validation & UFW Helpers
+# ------------------------------------------------------------------------------
+validate_port_and_proto() {
+    if [[ -z "$TARGET_PORT" ]] || ! [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || \
+       [[ "$TARGET_PORT" -lt 1 || "$TARGET_PORT" -gt 65535 ]]; then
+        pc_emit_error "Invalid --port '${TARGET_PORT}'. Must be an integer between 1 and 65535." 2
+        exit 2
+    fi
+
+    # Strip leading zeros (e.g., 0080 -> 80)
+    TARGET_PORT="$((10#$TARGET_PORT))"
+
+    case "$TARGET_PROTO" in
+        TCP|UDP|BOTH)
+            ;;
+        *)
+            pc_emit_error "Invalid --protocol '${TARGET_PROTO}'. Must be TCP, UDP, or BOTH." 2
+            exit 2
+            ;;
+    esac
+}
+
+ensure_ufw_ready() {
+    if ! command -v ufw >/dev/null 2>&1; then
+        pc_log "INFO" "ufw not found; installing 'ufw' package..."
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw >/dev/null
+    fi
+
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        pc_log "INFO" "Enabling UFW firewall with default incoming deny / outgoing allow..."
+        ufw default deny incoming >/dev/null
+        ufw default allow outgoing >/dev/null
+        ufw --force enable >/dev/null
+    fi
+}
+
+apply_ufw_port_rule() {
+    local port="$1"
+    local proto="$2"
+    local mode="$3" # "block" or "unblock"
+
+    local protos=()
+    if [[ "$proto" == "BOTH" ]]; then
+        protos=("tcp" "udp")
+    else
+        protos=("$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')")
+    fi
+
+    for p in "${protos[@]}"; do
+        if [[ "$mode" == "block" ]]; then
+            ufw deny out "${port}/${p}" comment "ParentControl-Port" >/dev/null 2>&1 || true
+            ufw deny in "${port}/${p}" comment "ParentControl-Port" >/dev/null 2>&1 || true
+        else
+            ufw delete deny out "${port}/${p}" >/dev/null 2>&1 || true
+            ufw delete deny in "${port}/${p}" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Ports State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_ports_state_json() {
+    pc_ensure_config_exists
+
+    local ufw_on="false"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_on="true"
+    fi
+
+    python3 -c '
+import json, sys
+
+cfg_path, ufw_active_str = sys.argv[1:3]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+raw_blocked = cfg.get("ports", {}).get("blocked", [])
+normalized = []
+for item in raw_blocked:
+    if isinstance(item, dict) and "port" in item:
+        normalized.append({
+            "port": int(item["port"]),
+            "protocol": str(item.get("protocol", "BOTH")).upper()
+        })
+    elif isinstance(item, int):
+        normalized.append({"port": item, "protocol": "BOTH"})
+
+normalized.sort(key=lambda x: (x["port"], x["protocol"]))
+
+print(json.dumps({
+    "ufw_active": ufw_active_str == "true",
+    "blocked_ports": normalized
+}))
+' "$PC_CONFIG_FILE" "$ufw_on"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+handle_block() {
+    validate_port_and_proto
+    ensure_ufw_ready
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    # If upgrading an existing TCP or UDP rule to BOTH, remove single-proto UFW rule first
+    if [[ "$TARGET_PROTO" == "BOTH" ]]; then
+        apply_ufw_port_rule "$TARGET_PORT" "BOTH" "block"
+    else
+        apply_ufw_port_rule "$TARGET_PORT" "$TARGET_PROTO" "block"
+    fi
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, port_num, proto_str, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+ports_cfg = data.setdefault("ports", {})
+existing = ports_cfg.get("blocked", [])
+
+cleaned = []
+for entry in existing:
+    if isinstance(entry, dict) and int(entry.get("port", -1)) == port_num:
+        # Replace existing rule on the same port if upgrading to BOTH or matching protocol
+        if proto_str == "BOTH" or str(entry.get("protocol", "")).upper() in (proto_str, "BOTH"):
+            continue
+    elif isinstance(entry, int) and entry == port_num:
+        continue
+    cleaned.append(entry)
+
+cleaned.append({"port": port_num, "protocol": proto_str})
+cleaned.sort(key=lambda x: (int(x["port"]), str(x["protocol"])))
+ports_cfg["blocked"] = cleaned
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$TARGET_PORT" "$TARGET_PROTO" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Blocked port ${TARGET_PORT}/${TARGET_PROTO} via UFW" "$state_json"
+}
+
+handle_unblock() {
+    validate_port_and_proto
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg removed_count
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    removed_count="$(python3 -c '
+import json, sys
+
+cfg_path, port_num, proto_str, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+ports_cfg = data.setdefault("ports", {})
+existing = ports_cfg.get("blocked", [])
+
+kept = []
+removed = 0
+for entry in existing:
+    if isinstance(entry, dict) and int(entry.get("port", -1)) == port_num:
+        entry_proto = str(entry.get("protocol", "BOTH")).upper()
+        if proto_str == "BOTH" or entry_proto == proto_str:
+            removed += 1
+            continue
+        elif entry_proto == "BOTH" and proto_str in ("TCP", "UDP"):
+            # Downgrade BOTH to the remaining protocol
+            other = "UDP" if proto_str == "TCP" else "TCP"
+            kept.append({"port": port_num, "protocol": other})
+            removed += 1
+            continue
+    elif isinstance(entry, int) and entry == port_num:
+        removed += 1
+        continue
+    kept.append(entry)
+
+ports_cfg["blocked"] = kept
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+
+print(removed)
+' "$PC_CONFIG_FILE" "$TARGET_PORT" "$TARGET_PROTO" "$tmp_cfg")"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$removed_count" -eq 0 ]]; then
+        pc_commit_transaction
+        pc_emit_error "No blocked port rule found for ${TARGET_PORT}/${TARGET_PROTO}." 2
+        exit 2
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        apply_ufw_port_rule "$TARGET_PORT" "$TARGET_PROTO" "unblock"
+    fi
+
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Unblocked port ${TARGET_PORT}/${TARGET_PROTO}" "$state_json"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Retrieved blocked network ports" "$state_json"
+}
+
+handle_apply() {
+    pc_ensure_config_exists
+
+    local rule_lines
+    rule_lines="$(python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+for entry in cfg.get("ports", {}).get("blocked", []):
+    if isinstance(entry, dict) and "port" in entry:
+        print(f"{int(entry[\"port\"])}|{str(entry.get(\"protocol\", \"BOTH\")).upper()}")
+    elif isinstance(entry, int):
+        print(f"{entry}|BOTH")
+' "$PC_CONFIG_FILE")"
+
+    if [[ -n "$rule_lines" ]]; then
+        ensure_ufw_ready
+        while IFS='|' read -r p_num p_proto; do
+            [[ -z "$p_num" ]] && continue
+            apply_ufw_port_rule "$p_num" "$p_proto" "block"
+        done <<< "$rule_lines"
+    fi
+
+    local state_json
+    state_json="$(build_ports_state_json)"
+    pc_emit_result "Applied all network port firewall rules" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_ports_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$PORTS_ACTION" in
+        block|add)
+            handle_block
+            ;;
+        unblock|remove)
+            handle_unblock
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${PORTS_ACTION}' (expected: block, unblock, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_PORTS_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-ports.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-ports.sh
+}
+
+# ------------------------------------------------------------------------------
+# Deploy /opt/parentcontrol/bin/pc-devices.sh (Sub-Chunk 4.2)
+# ------------------------------------------------------------------------------
+deploy_pc_devices_sh() {
+    log_step "Writing /opt/parentcontrol/bin/pc-devices.sh..."
+
+    cat << 'PC_DEVICES_SH_EOF' > /opt/parentcontrol/bin/pc-devices.sh
+#!/usr/bin/env bash
+# ==============================================================================
+# ParentControl - Hardware & Peripheral Access Control Manager
+# File: /opt/parentcontrol/bin/pc-devices.sh
+#
+# Description:
+#   Manages hardware peripheral restrictions (USB mass storage, webcam,
+#   microphone, Bluetooth) in config.json and enforces them across modprobe,
+#   udev rules, device nodes, and rfkill on Linux Mint 22.3.
+#
+# GUI HANDOFF:
+#   Invoked via pc-ctl.sh:
+#     pkexec /opt/parentcontrol/bin/pc-ctl.sh devices --action <verb> [OPTIONS] --json
+#
+#   Supported Actions:
+#     block   --device <usb_storage|webcam|microphone|bluetooth> --json
+#     unblock --device <usb_storage|webcam|microphone|bluetooth> --json
+#     set     --device <usb_storage|webcam|microphone|bluetooth> --blocked <true|false> --json
+#     list    --json
+#     apply   --json
+#
+#   JSON Data Schema (--action list --json):
+#     {
+#       "devices": {
+#         "usb_storage": false,
+#         "webcam": false,
+#         "microphone": false,
+#         "bluetooth": false
+#       },
+#       "rules": [
+#         {"device": "usb_storage", "label": "USB Mass Storage", "blocked": false},
+#         {"device": "webcam", "label": "Webcam / Camera", "blocked": false},
+#         {"device": "microphone", "label": "Microphone / Audio Input", "blocked": false},
+#         {"device": "bluetooth", "label": "Bluetooth", "blocked": false}
+#       ]
+#     }
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# shellcheck source=/opt/parentcontrol/lib/common.sh
+source "/opt/parentcontrol/lib/common.sh"
+
+PC_MODULE_NAME="devices"
+PC_CURRENT_ACTION="list"
+PC_SCRIPT_DESC="Manages hardware peripheral blocks (USB storage, webcam, microphone, Bluetooth)."
+PC_SCRIPT_USAGE="pc-devices.sh --action <block|unblock|set|list|apply> [--device <name>] [--blocked <true|false>] [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         block, unblock, set, list, apply
+      --device <name>         usb_storage | webcam | microphone | bluetooth
+      --blocked <true|false>  Target state when using --action set"
+
+readonly PC_MODPROBE_CONF="/etc/modprobe.d/parentcontrol-devices.conf"
+readonly PC_UDEV_RULES="/etc/udev/rules.d/99-parentcontrol-devices.rules"
+
+DEVICES_ACTION=""
+TARGET_DEVICE=""
+TARGET_BLOCKED=""
+
+# ------------------------------------------------------------------------------
+# Parse Module-Specific Flags
+# ------------------------------------------------------------------------------
+parse_devices_args() {
+    pc_parse_common_flags "$@"
+    set -- "${PC_REMAINING_ARGS[@]}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --action)
+                DEVICES_ACTION="${2:-}"
+                shift 2
+                ;;
+            --device)
+                TARGET_DEVICE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+                shift 2
+                ;;
+            --blocked)
+                TARGET_BLOCKED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
+                shift 2
+                ;;
+            *)
+                pc_emit_error "Unknown flag for pc-devices.sh: $1" 2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$DEVICES_ACTION" ]]; then
+        pc_emit_error "Missing required --action <block|unblock|set|list|apply>." 2
+        exit 2
+    fi
+    PC_CURRENT_ACTION="$DEVICES_ACTION"
+}
+
+validate_device_name() {
+    case "$TARGET_DEVICE" in
+        usb_storage|webcam|microphone|bluetooth)
+            ;;
+        *)
+            pc_emit_error "Invalid --device '${TARGET_DEVICE}'. Must be one of: usb_storage, webcam, microphone, bluetooth." 2
+            exit 2
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# Enforce Device Rules via modprobe, udev, /dev/snd, and rfkill
+# ------------------------------------------------------------------------------
+enforce_device_rules() {
+    pc_ensure_config_exists
+
+    pc_backup_file "$PC_MODPROBE_CONF"
+    pc_backup_file "$PC_UDEV_RULES"
+
+    mkdir -p /etc/modprobe.d /etc/udev/rules.d
+
+    local state_flags
+    state_flags="$(python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+devs = cfg.get("devices", {})
+usb = "1" if devs.get("usb_storage", False) else "0"
+cam = "1" if devs.get("webcam", False) else "0"
+mic = "1" if devs.get("microphone", False) else "0"
+bt  = "1" if devs.get("bluetooth", False) else "0"
+print(f"{usb}|{cam}|{mic}|{bt}")
+' "$PC_CONFIG_FILE")"
+
+    local block_usb block_cam block_mic block_bt
+    IFS='|' read -r block_usb block_cam block_mic block_bt <<< "$state_flags"
+
+    local tmp_modprobe tmp_udev
+    tmp_modprobe="$(mktemp /tmp/pc-modprobe.XXXXXX)"
+    tmp_udev="$(mktemp /tmp/pc-udev.XXXXXX)"
+
+    cat << 'HEADER_EOF' > "$tmp_modprobe"
+# Managed by ParentControl (pc-devices.sh) - DO NOT EDIT MANUALLY
+HEADER_EOF
+
+    cat << 'HEADER_EOF' > "$tmp_udev"
+# Managed by ParentControl (pc-devices.sh) - DO NOT EDIT MANUALLY
+HEADER_EOF
+
+    # 1. USB Mass Storage (preserves USB keyboards/mice via HID class 03)
+    if [[ "$block_usb" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_modprobe"
+blacklist usb-storage
+install usb-storage /bin/false
+blacklist uas
+install uas /bin/false
+EOF
+        cat << 'EOF' >> "$tmp_udev"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="08", RUN+="/bin/sh -c 'echo 0 > /sys$devpath/../authorized 2>/dev/null || true'"
+EOF
+        modprobe -r uas 2>/dev/null || true
+        modprobe -r usb_storage 2>/dev/null || true
+    fi
+
+    # 2. Webcam / Video Capture
+    if [[ "$block_cam" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_modprobe"
+blacklist uvcvideo
+install uvcvideo /bin/false
+EOF
+        cat << 'EOF' >> "$tmp_udev"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="0e", RUN+="/bin/sh -c 'echo 0 > /sys$devpath/../authorized 2>/dev/null || true'"
+EOF
+        modprobe -r uvcvideo 2>/dev/null || true
+    fi
+
+    # 3. Microphone / ALSA Capture Nodes (preserves speaker playback nodes pcm*p)
+    if [[ "$block_mic" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_udev"
+SUBSYSTEM=="sound", KERNEL=="pcm*c", MODE="0000", OPTIONS+="last_rule"
+EOF
+    fi
+
+    # 4. Bluetooth
+    if [[ "$block_bt" == "1" ]]; then
+        cat << 'EOF' >> "$tmp_modprobe"
+blacklist btusb
+install btusb /bin/false
+blacklist bluetooth
+install bluetooth /bin/false
+EOF
+        cat << 'EOF' >> "$tmp_udev"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{bInterfaceClass}=="e0", ATTR{bInterfaceSubClass}=="01", ATTR{bInterfaceProtocol}=="01", RUN+="/bin/sh -c 'echo 0 > /sys$devpath/../authorized 2>/dev/null || true'"
+EOF
+        if command -v rfkill >/dev/null 2>&1; then
+            rfkill block bluetooth >/dev/null 2>&1 || true
+        fi
+        modprobe -r btusb 2>/dev/null || true
+    else
+        if command -v rfkill >/dev/null 2>&1; then
+            rfkill unblock bluetooth >/dev/null 2>&1 || true
+        fi
+    fi
+
+    chown root:root "$tmp_modprobe" "$tmp_udev"
+    chmod 0644 "$tmp_modprobe" "$tmp_udev"
+    mv "$tmp_modprobe" "$PC_MODPROBE_CONF"
+    mv "$tmp_udev" "$PC_UDEV_RULES"
+
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1 || true
+    fi
+
+    # Apply or restore live microphone capture node permissions immediately
+    if [[ "$block_mic" == "1" ]]; then
+        shopt -s nullglob
+        for cap_dev in /dev/snd/pcm*c; do
+            setfacl -b "$cap_dev" 2>/dev/null || true
+            chmod 0000 "$cap_dev" 2>/dev/null || true
+        done
+        shopt -u nullglob
+    else
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm trigger --subsystem-match=sound >/dev/null 2>&1 || true
+        fi
+    fi
+
+    pc_log "INFO" "Enforced device policies (usb_storage=${block_usb}, webcam=${block_cam}, microphone=${block_mic}, bluetooth=${block_bt})."
+}
+
+# ------------------------------------------------------------------------------
+# Build Standardized Devices State JSON for GUI Hydration
+# ------------------------------------------------------------------------------
+build_devices_state_json() {
+    pc_ensure_config_exists
+
+    python3 -c '
+import json, sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+devs = cfg.get("devices", {})
+state = {
+    "usb_storage": bool(devs.get("usb_storage", False)),
+    "webcam": bool(devs.get("webcam", False)),
+    "microphone": bool(devs.get("microphone", False)),
+    "bluetooth": bool(devs.get("bluetooth", False))
+}
+
+labels = {
+    "usb_storage": "USB Mass Storage",
+    "webcam": "Webcam / Camera",
+    "microphone": "Microphone / Audio Input",
+    "bluetooth": "Bluetooth"
+}
+
+rules = [
+    {"device": key, "label": labels[key], "blocked": state[key]}
+    for key in ("usb_storage", "webcam", "microphone", "bluetooth")
+]
+
+print(json.dumps({
+    "devices": state,
+    "rules": rules
+}))
+' "$PC_CONFIG_FILE"
+}
+
+# ------------------------------------------------------------------------------
+# Action Handlers
+# ------------------------------------------------------------------------------
+set_device_blocked_state() {
+    local dev_name="$1"
+    local is_blocked="$2" # "true" or "false"
+
+    pc_init_transaction
+    pc_ensure_config_exists
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 -c '
+import json, sys
+
+cfg_path, dev_key, blocked_str, out_path = sys.argv[1:5]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+devs = data.setdefault("devices", {
+    "usb_storage": False,
+    "webcam": False,
+    "microphone": False,
+    "bluetooth": False
+})
+devs[dev_key] = (blocked_str == "true")
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+' "$PC_CONFIG_FILE" "$dev_name" "$is_blocked" "$tmp_cfg"
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    enforce_device_rules
+    pc_commit_transaction
+
+    local verb_word="Blocked"
+    [[ "$is_blocked" == "false" ]] && verb_word="Unblocked"
+
+    local state_json
+    state_json="$(build_devices_state_json)"
+    pc_emit_result "${verb_word} hardware device '${dev_name}'" "$state_json"
+}
+
+handle_block() {
+    validate_device_name
+    set_device_blocked_state "$TARGET_DEVICE" "true"
+}
+
+handle_unblock() {
+    validate_device_name
+    set_device_blocked_state "$TARGET_DEVICE" "false"
+}
+
+handle_set() {
+    validate_device_name
+    if [[ "$TARGET_BLOCKED" != "true" && "$TARGET_BLOCKED" != "false" ]]; then
+        pc_emit_error "Action 'set' requires --blocked <true|false>." 2
+        exit 2
+    fi
+    set_device_blocked_state "$TARGET_DEVICE" "$TARGET_BLOCKED"
+}
+
+handle_list() {
+    local state_json
+    state_json="$(build_devices_state_json)"
+    pc_emit_result "Retrieved hardware device control states" "$state_json"
+}
+
+handle_apply() {
+    pc_init_transaction
+    enforce_device_rules
+    pc_commit_transaction
+
+    local state_json
+    state_json="$(build_devices_state_json)"
+    pc_emit_result "Applied all hardware device control rules" "$state_json"
+}
+
+# ------------------------------------------------------------------------------
+# Main Execution
+# ------------------------------------------------------------------------------
+main() {
+    parse_devices_args "$@"
+    pc_require_root
+    pc_verify_mint
+
+    case "$DEVICES_ACTION" in
+        block)
+            handle_block
+            ;;
+        unblock)
+            handle_unblock
+            ;;
+        set)
+            handle_set
+            ;;
+        list)
+            handle_list
+            ;;
+        apply)
+            handle_apply
+            ;;
+        *)
+            pc_emit_error "Unsupported action '${DEVICES_ACTION}' (expected: block, unblock, set, list, apply)." 2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
+PC_DEVICES_SH_EOF
+
+    chown root:root /opt/parentcontrol/bin/pc-devices.sh
+    chmod 0755 /opt/parentcontrol/bin/pc-devices.sh
+}
+
+
 # ------------------------------------------------------------------------------
 # Deploy Initial Master Configuration (/etc/parentcontrol/config.json)
 # ------------------------------------------------------------------------------
@@ -2679,9 +3460,7 @@ deploy_initial_config() {
     '
 }
 
-# ------------------------------------------------------------------------------
-# Automated Verification Self-Test
-# ------------------------------------------------------------------------------
+
 # ------------------------------------------------------------------------------
 # Automated Verification Self-Test
 # ------------------------------------------------------------------------------
@@ -2697,6 +3476,8 @@ run_self_test() {
     /opt/parentcontrol/bin/pc-ctl.sh logs --action read --lines 5 "${test_flags[@]}"
     /opt/parentcontrol/bin/pc-ctl.sh acl --action list "${test_flags[@]}"
     /opt/parentcontrol/bin/pc-ctl.sh perms --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh ports --action list "${test_flags[@]}"
+    /opt/parentcontrol/bin/pc-ctl.sh devices --action list "${test_flags[@]}"
 }
 
 # ------------------------------------------------------------------------------
@@ -2712,12 +3493,14 @@ main() {
     deploy_pc_setup_sh
     deploy_pc_net_acl_sh
     deploy_pc_perms_sh
+    deploy_pc_ports_sh
+    deploy_pc_devices_sh
     deploy_initial_config
 
     if [[ "$SKIP_TEST" -eq 0 ]]; then
         run_self_test
     else
-        printf '[OK] ParentControl Part 3 deployed (self-test skipped).\n'
+        printf '[OK] ParentControl Sub-Chunk 4.2 deployed (self-test skipped).\n'
     fi
 }
 
