@@ -132,7 +132,7 @@ create_directories() {
 
     mkdir -p /etc/parentcontrol
     chown root:root /etc/parentcontrol
-    chmod 0750 /etc/parentcontrol
+    chmod 0755 /etc/parentcontrol
 
     mkdir -p /var/log/parentcontrol
     chown root:root /var/log/parentcontrol
@@ -1034,7 +1034,7 @@ with open(cfg_path, "r", encoding="utf-8") as f:
 pub_data = {
     "restricted_user": cfg.get("restricted_user", ""),
     "admin_contact": cfg.get("admin_contact", {
-        "name": "Parent / Caregiver",
+        "name": "Caregiver / Parent",
         "email": "",
         "phone": "",
         "note": "Use this form to request access to an app or website."
@@ -1044,6 +1044,7 @@ tmp_path = pub_path + ".tmp"
 with open(tmp_path, "w", encoding="utf-8") as wf:
     json.dump(pub_data, wf, indent=2)
     wf.write("\n")
+os.chmod(os.path.dirname(pub_path), 0o755)
 os.chmod(tmp_path, 0o644)
 os.replace(tmp_path, pub_path)
 ' "$PC_CONFIG_FILE" "$PC_PUBLIC_INFO"
@@ -1252,8 +1253,8 @@ handle_wizard() {
     fi
 
     printf '\n3. Select Care Profile:\n'
-    printf '   [1] Child / Student Safety\n'
-    printf '   [2] Dementia / Senior Care (enables larger text & disables hot-corners)\n'
+    printf '   [1] Dementia / Senior Care (enables larger text & disables hot-corners)\n'
+    printf '   [2] Child / Student Safety\n'
     read -rp "   Choose profile [1/2, default 1]: " prof_choice
 
     printf '\n4. Caregiver / Admin Contact Info (shown on the user'\''s "Request Access" popup):\n'
@@ -1269,7 +1270,7 @@ handle_wizard() {
     handle_provision_admin
     handle_set_contact
 
-    if [[ "$prof_choice" == "2" && -x "${PC_BIN_DIR}/pc-maint.sh" ]]; then
+    if [[ "${prof_choice:-1}" == "1" && -x "${PC_BIN_DIR}/pc-maint.sh" ]]; then
         "${PC_BIN_DIR}/pc-maint.sh" --action senior-preset --enabled true >/dev/null
     fi
     if [[ -x "${PC_BIN_DIR}/pc-ports.sh" ]]; then
@@ -1339,22 +1340,28 @@ source "/opt/parentcontrol/lib/common.sh"
 
 PC_MODULE_NAME="acl"
 PC_CURRENT_ACTION="list"
-PC_SCRIPT_DESC="Manages Web/Network whitelist, greylist, blacklist, and toggleable blocklist feeds."
+PC_SCRIPT_DESC="Manages Web/Network whitelist, greylist, blacklist, and toggleable blocklist feeds (StevenBlack & Phishing Army)."
 PC_SCRIPT_USAGE="pc-net-acl.sh --action <add|remove|list|sync|toggle-feed|set-feed|export-policy|apply> [OPTIONS]"
 PC_SCRIPT_FLAGS="      --action <verb>         add, remove, list, sync, toggle-feed, set-feed, export-policy, apply
       --list <type>           whitelist | greylist | blacklist
       --target <domain|ip>    Domain, URL, or IPv4/IPv6 address
-      --enabled <true|false>  Enable or disable the default web blocklist feed
+      --feed <id>             stevenblack | phishing_army (defaults to stevenblack)
+      --enabled <true|false>  Enable or disable the specified blocklist feed
       --url <feed_url>        Custom hosts blocklist feed URL"
 
-PC_FEED_CACHE="${PC_FEED_CACHE:-${PC_VAR_DIR}/feed-blocklist.txt}"
 PC_HOSTS_FILE="${PC_HOSTS_FILE:-/etc/hosts}"
 PC_HOSTS_BEGIN="${PC_HOSTS_BEGIN:-# BEGIN PARENTCONTROL MANAGED BLOCKS}"
 PC_HOSTS_END="${PC_HOSTS_END:-# END PARENTCONTROL MANAGED BLOCKS}"
 
+readonly PC_STEVENBLACK_URL="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+readonly PC_PHISHING_ARMY_URL="https://phishing.army/download/phishing_army_blocklist_extended.txt"
+readonly PC_FEED_SB_CACHE="${PC_VAR_DIR}/feed-stevenblack.txt"
+readonly PC_FEED_PA_CACHE="${PC_VAR_DIR}/feed-phishing_army.txt"
+
 ACL_ACTION=""
 ACL_LIST=""
 ACL_TARGET=""
+FEED_ID=""
 FEED_ENABLED=""
 FEED_URL=""
 
@@ -1367,6 +1374,7 @@ parse_acl_args() {
             --action)  ACL_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
             --list)    ACL_LIST="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
             --target)  ACL_TARGET="${2:-}"; shift 2 ;;
+            --feed)    FEED_ID="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
             --enabled) FEED_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
             --url)     FEED_URL="${2:-}"; shift 2 ;;
             *) pc_emit_error "Unknown flag for pc-net-acl.sh: $1" 2; exit 2 ;;
@@ -1380,8 +1388,67 @@ parse_acl_args() {
     PC_CURRENT_ACTION="$ACL_ACTION"
 }
 
+ensure_feed_schema() {
+    pc_ensure_config_exists
+    python3 - "$PC_CONFIG_FILE" "$PC_STEVENBLACK_URL" "$PC_PHISHING_ARMY_URL" << 'PYEOF'
+import json, os, sys
+
+cfg_path, sb_url, pa_url = sys.argv[1:4]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+net = data.setdefault("network", {})
+changed = False
+
+if "feed_sources" not in net or not isinstance(net["feed_sources"], dict):
+    legacy_enabled = bool(net.get("default_feed_enabled", True))
+    legacy_feeds = net.get("feeds", [])
+    custom_sb = legacy_feeds[0] if legacy_feeds else sb_url
+    net["feed_sources"] = {
+        "stevenblack": {
+            "id": "stevenblack",
+            "label": "StevenBlack Hosts (Ads & Malware)",
+            "url": custom_sb,
+            "enabled": legacy_enabled
+        },
+        "phishing_army": {
+            "id": "phishing_army",
+            "label": "Phishing Army (Phishing & Scams)",
+            "url": pa_url,
+            "enabled": False
+        }
+    }
+    changed = True
+else:
+    if "stevenblack" not in net["feed_sources"]:
+        net["feed_sources"]["stevenblack"] = {
+            "id": "stevenblack",
+            "label": "StevenBlack Hosts (Ads & Malware)",
+            "url": sb_url,
+            "enabled": bool(net.get("default_feed_enabled", True))
+        }
+        changed = True
+    if "phishing_army" not in net["feed_sources"]:
+        net["feed_sources"]["phishing_army"] = {
+            "id": "phishing_army",
+            "label": "Phishing Army (Phishing & Scams)",
+            "url": pa_url,
+            "enabled": False
+        }
+        changed = True
+
+if changed:
+    tmp_path = cfg_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as wf:
+        json.dump(data, wf, indent=2)
+        wf.write("\n")
+    os.chmod(tmp_path, 0o640)
+    os.replace(tmp_path, cfg_path)
+PYEOF
+}
+
 normalize_target() {
-    python3 -c '
+    python3 - "$1" << 'PYEOF'
 import re, sys
 from urllib.parse import urlparse
 
@@ -1396,70 +1463,101 @@ host = host.strip(".")
 if not host or not re.match(r"^[a-z0-9._:-]+$", host):
     sys.exit(1)
 print(host)
-' "$1"
+PYEOF
 }
 
-sync_blocklist_feed() {
-    pc_ensure_config_exists
+download_single_feed() {
+    local url="$1"
+    local cache_file="$2"
     mkdir -p "$PC_VAR_DIR"
-
-    local feed_url
-    feed_url="$(python3 -c '
-import json, sys
-cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-feeds = cfg.get("network", {}).get("feeds", [])
-print(feeds[0] if feeds else "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts")
-' "$PC_CONFIG_FILE")"
 
     local tmp_dl tmp_clean
     tmp_dl="$(mktemp /tmp/pc-feed-dl.XXXXXX)"
     tmp_clean="$(mktemp /tmp/pc-feed-clean.XXXXXX)"
 
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$feed_url" -o "$tmp_dl" 2>/dev/null; then
-        python3 -c '
-import sys
+    if curl -fsSL --connect-timeout 10 --max-time 35 "$url" -o "$tmp_dl" 2>/dev/null; then
+        python3 - "$tmp_dl" "$tmp_clean" << 'PYEOF'
+import re, sys
+
 in_path, out_path = sys.argv[1:3]
 domains = set()
+dom_re = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
+skip = {"localhost", "localhost.localdomain", "broadcasthost", "local", "ip6-localhost", "ip6-loopback"}
+
 with open(in_path, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
         s = line.strip()
-        if not s or s.startswith("#"):
+        if not s or s.startswith("#") or s.startswith("!"):
             continue
+        s = s.split("#", 1)[0].strip()
         parts = s.split()
-        dom = parts[1].lower() if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1") else parts[0].lower()
-        if dom not in ("localhost", "localhost.localdomain", "broadcasthost", "local") and "." in dom:
+        if not parts:
+            continue
+        if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::", "::1"):
+            dom = parts[1].lower()
+        else:
+            dom = parts[0].lower()
+        if dom not in skip and dom_re.match(dom):
             domains.add(dom)
+
 with open(out_path, "w", encoding="utf-8") as wf:
     for d in sorted(domains):
         wf.write(d + "\n")
-' "$tmp_dl" "$tmp_clean"
-        mv "$tmp_clean" "$PC_FEED_CACHE"
-        chmod 0644 "$PC_FEED_CACHE"
+PYEOF
+        mv "$tmp_clean" "$cache_file"
+        chmod 0644 "$cache_file"
     else
         rm -f "$tmp_clean"
-        [[ -f "$PC_FEED_CACHE" ]] || : > "$PC_FEED_CACHE"
+        [[ -f "$cache_file" ]] || : > "$cache_file"
     fi
     rm -f "$tmp_dl"
 }
 
+sync_enabled_feeds() {
+    ensure_feed_schema
+    local feed_dump
+    feed_dump="$(python3 - "$PC_CONFIG_FILE" << 'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+sources = cfg.get("network", {}).get("feed_sources", {})
+for fid, info in sources.items():
+    en = "1" if info.get("enabled") else "0"
+    print(f"{fid}|{en}|{info.get('url', '')}")
+PYEOF
+)"
+    while IFS='|' read -r fid enabled url; do
+        [[ "$enabled" == "1" && -n "$url" ]] || continue
+        if [[ "$fid" == "stevenblack" ]]; then
+            download_single_feed "$url" "$PC_FEED_SB_CACHE"
+        elif [[ "$fid" == "phishing_army" ]]; then
+            download_single_feed "$url" "$PC_FEED_PA_CACHE"
+        fi
+    done <<< "$feed_dump"
+}
+
 enforce_network_rules() {
-    pc_ensure_config_exists
+    ensure_feed_schema
     pc_backup_file "$PC_HOSTS_FILE"
 
     local tmp_hosts
     tmp_hosts="$(mktemp /tmp/pc-hosts.XXXXXX)"
 
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" "$PC_HOSTS_FILE" "$PC_FEED_SB_CACHE" "$PC_FEED_PA_CACHE" "$PC_HOSTS_BEGIN" "$PC_HOSTS_END" "$tmp_hosts" << 'PYEOF'
 import json, os, sys
 
-cfg_path, hosts_path, feed_path, begin_mark, end_mark, out_path = sys.argv[1:7]
+cfg_path, hosts_path, sb_cache, pa_cache, begin_mark, end_mark, out_path = sys.argv[1:8]
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
 net = cfg.get("network", {})
 whitelist = {x.lower() for x in net.get("whitelist", [])}
+greylist = {x.lower() for x in net.get("greylist", [])}
+allowed = whitelist | greylist
 blacklist = [x.lower() for x in net.get("blacklist", [])]
-feed_enabled = bool(net.get("default_feed_enabled", True))
+sources = net.get("feed_sources", {})
+
+sb_enabled = bool(sources.get("stevenblack", {}).get("enabled", False))
+pa_enabled = bool(sources.get("phishing_army", {}).get("enabled", False))
 
 existing = []
 if os.path.isfile(hosts_path):
@@ -1479,17 +1577,18 @@ blocked_domains = []
 seen = set()
 
 for dom in blacklist:
-    if dom not in whitelist and dom not in seen:
+    if dom not in allowed and dom not in seen:
         seen.add(dom)
         blocked_domains.append(dom)
 
-if feed_enabled and os.path.isfile(feed_path):
-    with open(feed_path, "r", encoding="utf-8", errors="ignore") as ff:
-        for line in ff:
-            dom = line.strip().lower()
-            if dom and dom not in whitelist and dom not in seen:
-                seen.add(dom)
-                blocked_domains.append(dom)
+for enabled, cache_file in ((sb_enabled, sb_cache), (pa_enabled, pa_cache)):
+    if enabled and os.path.isfile(cache_file):
+        with open(cache_file, "r", encoding="utf-8", errors="ignore") as ff:
+            for line in ff:
+                dom = line.strip().lower()
+                if dom and dom not in allowed and dom not in seen:
+                    seen.add(dom)
+                    blocked_domains.append(dom)
 
 with open(out_path, "w", encoding="utf-8") as wf:
     for ln in existing:
@@ -1499,7 +1598,7 @@ with open(out_path, "w", encoding="utf-8") as wf:
         for dom in blocked_domains:
             wf.write(f"0.0.0.0 {dom}\n")
         wf.write(end_mark + "\n")
-' "$PC_CONFIG_FILE" "$PC_HOSTS_FILE" "$PC_FEED_CACHE" "$PC_HOSTS_BEGIN" "$PC_HOSTS_END" "$tmp_hosts"
+PYEOF
 
     chown root:root "$tmp_hosts"
     chmod 0644 "$tmp_hosts"
@@ -1507,11 +1606,11 @@ with open(out_path, "w", encoding="utf-8") as wf:
 }
 
 build_acl_state_json() {
-    pc_ensure_config_exists
-    python3 -c '
+    ensure_feed_schema
+    python3 - "$PC_CONFIG_FILE" "$PC_FEED_SB_CACHE" "$PC_FEED_PA_CACHE" << 'PYEOF'
 import json, os, sys
 
-cfg_path, feed_path = sys.argv[1:3]
+cfg_path, sb_cache, pa_cache = sys.argv[1:4]
 with open(cfg_path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 
@@ -1519,13 +1618,24 @@ net = cfg.get("network", {})
 white = net.get("whitelist", [])
 grey  = net.get("greylist", [])
 black = net.get("blacklist", [])
-feed_enabled = bool(net.get("default_feed_enabled", True))
-feeds = net.get("feeds", ["https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"])
+sources = net.get("feed_sources", {})
 
-feed_count = 0
-if os.path.isfile(feed_path):
-    with open(feed_path, "r", encoding="utf-8", errors="ignore") as ff:
-        feed_count = sum(1 for _ in ff)
+def count_lines(p):
+    if not os.path.isfile(p):
+        return 0
+    with open(p, "r", encoding="utf-8", errors="ignore") as ff:
+        return sum(1 for ln in ff if ln.strip())
+
+sb_count = count_lines(sb_cache)
+pa_count = count_lines(pa_cache)
+
+sb_info = dict(sources.get("stevenblack", {}))
+sb_info["domains_count"] = sb_count
+pa_info = dict(sources.get("phishing_army", {}))
+pa_info["domains_count"] = pa_count
+
+any_enabled = bool(sb_info.get("enabled") or pa_info.get("enabled"))
+active_domains = (sb_count if sb_info.get("enabled") else 0) + (pa_count if pa_info.get("enabled") else 0)
 
 rules = (
     [{"list": "whitelist", "target": x} for x in white] +
@@ -1534,15 +1644,19 @@ rules = (
 )
 
 print(json.dumps({
-    "default_feed_enabled": feed_enabled,
+    "default_feed_enabled": any_enabled,
+    "feed_sources": {
+        "stevenblack": sb_info,
+        "phishing_army": pa_info
+    },
     "whitelist": white,
     "greylist": grey,
     "blacklist": black,
     "rules": rules,
-    "feeds": feeds,
-    "feed_domains_count": feed_count
+    "feeds": [sb_info.get("url", ""), pa_info.get("url", "")],
+    "feed_domains_count": active_domains
 }))
-' "$PC_CONFIG_FILE" "$PC_FEED_CACHE"
+PYEOF
 }
 
 handle_add() {
@@ -1558,13 +1672,13 @@ handle_add() {
     fi
 
     pc_init_transaction
-    pc_ensure_config_exists
+    ensure_feed_schema
     pc_backup_file "$PC_CONFIG_FILE"
 
     local tmp_cfg
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
 
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" "$ACL_LIST" "$norm_target" "$tmp_cfg" << 'PYEOF'
 import json, sys
 
 cfg_path, target_list, item, out_path = sys.argv[1:5]
@@ -1582,7 +1696,7 @@ for lst in ("whitelist", "greylist", "blacklist"):
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-' "$PC_CONFIG_FILE" "$ACL_LIST" "$norm_target" "$tmp_cfg"
+PYEOF
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
@@ -1591,9 +1705,7 @@ with open(out_path, "w", encoding="utf-8") as wf:
     enforce_network_rules
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_acl_state_json)"
-    pc_emit_result "Added '${norm_target}' to ${ACL_LIST}" "$state_json"
+    pc_emit_result "Added '${norm_target}' to ${ACL_LIST}" "$(build_acl_state_json)"
 }
 
 handle_remove() {
@@ -1604,13 +1716,13 @@ handle_remove() {
     fi
 
     pc_init_transaction
-    pc_ensure_config_exists
+    ensure_feed_schema
     pc_backup_file "$PC_CONFIG_FILE"
 
     local tmp_cfg removed_flag
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
 
-    removed_flag="$(python3 -c '
+    removed_flag="$(python3 - "$PC_CONFIG_FILE" "$ACL_LIST" "$norm_target" "$tmp_cfg" << 'PYEOF'
 import json, sys
 
 cfg_path, target_list, item, out_path = sys.argv[1:5]
@@ -1631,7 +1743,8 @@ with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
 print("1" if found else "0")
-' "$PC_CONFIG_FILE" "$ACL_LIST" "$norm_target" "$tmp_cfg")"
+PYEOF
+)"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
@@ -1646,9 +1759,7 @@ print("1" if found else "0")
     enforce_network_rules
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_acl_state_json)"
-    pc_emit_result "Removed '${norm_target}' from ACL" "$state_json"
+    pc_emit_result "Removed '${norm_target}' from ACL" "$(build_acl_state_json)"
 }
 
 handle_toggle_feed() {
@@ -1657,17 +1768,58 @@ handle_toggle_feed() {
         exit 2
     fi
 
+    local target_feed="${FEED_ID:-stevenblack}"
+    case "$target_feed" in
+        stevenblack|phishing_army|all) ;;
+        *) pc_emit_error "Invalid --feed '${target_feed}' (expected: stevenblack, phishing_army, all)." 2; exit 2 ;;
+    esac
+
     pc_init_transaction
-    pc_json_set "network.default_feed_enabled" "$FEED_ENABLED"
-    if [[ "$FEED_ENABLED" == "true" && ! -s "$PC_FEED_CACHE" ]]; then
-        sync_blocklist_feed
+    ensure_feed_schema
+    pc_backup_file "$PC_CONFIG_FILE"
+
+    local tmp_cfg
+    tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
+
+    python3 - "$PC_CONFIG_FILE" "$target_feed" "$FEED_ENABLED" "$tmp_cfg" << 'PYEOF'
+import json, sys
+
+cfg_path, fid, enabled_str, out_path = sys.argv[1:5]
+enabled = (enabled_str == "true")
+data = json.load(open(cfg_path, "r", encoding="utf-8"))
+sources = data.setdefault("network", {}).setdefault("feed_sources", {})
+
+if fid == "all":
+    for key in sources:
+        sources[key]["enabled"] = enabled
+else:
+    if fid in sources:
+        sources[fid]["enabled"] = enabled
+
+data["network"]["default_feed_enabled"] = any(v.get("enabled", False) for v in sources.values())
+
+with open(out_path, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+    wf.write("\n")
+PYEOF
+
+    chown root:root "$tmp_cfg"
+    chmod 0640 "$tmp_cfg"
+    mv "$tmp_cfg" "$PC_CONFIG_FILE"
+
+    if [[ "$FEED_ENABLED" == "true" ]]; then
+        if [[ "$target_feed" == "stevenblack" || "$target_feed" == "all" ]] && [[ ! -s "$PC_FEED_SB_CACHE" ]]; then
+            download_single_feed "$PC_STEVENBLACK_URL" "$PC_FEED_SB_CACHE"
+        fi
+        if [[ "$target_feed" == "phishing_army" || "$target_feed" == "all" ]] && [[ ! -s "$PC_FEED_PA_CACHE" ]]; then
+            download_single_feed "$PC_PHISHING_ARMY_URL" "$PC_FEED_PA_CACHE"
+        fi
     fi
+
     enforce_network_rules
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_acl_state_json)"
-    pc_emit_result "Set default web blocklist feed enabled=${FEED_ENABLED}" "$state_json"
+    pc_emit_result "Set blocklist feed '${target_feed}' enabled=${FEED_ENABLED}" "$(build_acl_state_json)"
 }
 
 handle_set_feed() {
@@ -1675,36 +1827,45 @@ handle_set_feed() {
         pc_emit_error "Action 'set-feed' requires --url <feed_url>." 2
         exit 2
     fi
+    local target_feed="${FEED_ID:-stevenblack}"
+    case "$target_feed" in
+        stevenblack|phishing_army) ;;
+        *) pc_emit_error "Invalid --feed '${target_feed}' (expected: stevenblack, phishing_army)." 2; exit 2 ;;
+    esac
 
     pc_init_transaction
-    pc_ensure_config_exists
+    ensure_feed_schema
     pc_backup_file "$PC_CONFIG_FILE"
 
     local tmp_cfg
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" "$target_feed" "$FEED_URL" "$tmp_cfg" << 'PYEOF'
 import json, sys
-cfg_path, url, out_path = sys.argv[1:4]
+cfg_path, fid, url, out_path = sys.argv[1:5]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
-net = data.setdefault("network", {})
-net["feeds"] = [url]
-net["default_feed_enabled"] = True
+sources = data.setdefault("network", {}).setdefault("feed_sources", {})
+if fid in sources:
+    sources[fid]["url"] = url
+    sources[fid]["enabled"] = True
+data["network"]["default_feed_enabled"] = True
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-' "$PC_CONFIG_FILE" "$FEED_URL" "$tmp_cfg"
+PYEOF
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
     mv "$tmp_cfg" "$PC_CONFIG_FILE"
 
-    sync_blocklist_feed
+    if [[ "$target_feed" == "stevenblack" ]]; then
+        download_single_feed "$FEED_URL" "$PC_FEED_SB_CACHE"
+    else
+        download_single_feed "$FEED_URL" "$PC_FEED_PA_CACHE"
+    fi
     enforce_network_rules
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_acl_state_json)"
-    pc_emit_result "Updated and synced web blocklist feed URL" "$state_json"
+    pc_emit_result "Updated and synced blocklist feed '${target_feed}'" "$(build_acl_state_json)"
 }
 
 main() {
@@ -1719,14 +1880,12 @@ main() {
         set-feed)      handle_set_feed ;;
         sync)
             pc_init_transaction
-            sync_blocklist_feed
+            sync_enabled_feeds
             enforce_network_rules
             pc_commit_transaction
-            pc_emit_result "Synced web blocklist feed" "$(build_acl_state_json)"
+            pc_emit_result "Synced enabled web blocklist feeds" "$(build_acl_state_json)"
             ;;
         list|export-policy)
-            # Note: export-policy schema will be adapted to match the browser extension's
-            # finalized policy template once extension integration is ready.
             pc_emit_result "Retrieved network ACL rules" "$(build_acl_state_json)"
             ;;
         apply)
@@ -1823,7 +1982,7 @@ resolve_safe_user_path() {
     local raw_path="$1"
     local user_home="$2"
 
-    python3 -c '
+    python3 - "$raw_path" "$user_home" << 'PYEOF'
 import os, sys
 
 raw, home = sys.argv[1].strip(), sys.argv[2].strip()
@@ -1848,7 +2007,7 @@ if resolved in forbidden:
     sys.exit(2)
 
 print(resolved)
-' "$raw_path" "$user_home"
+PYEOF
 }
 
 normalize_rwx_and_label() {
@@ -1914,7 +2073,7 @@ enforce_all_perms() {
     pc_ensure_config_exists
 
     local dump
-    dump="$(python3 -c '
+    dump="$(python3 - "$PC_CONFIG_FILE" << 'PYEOF'
 import json, sys
 cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 perms = cfg.get("permissions", {})
@@ -1923,8 +2082,11 @@ print("PRESET|lock_dotfiles|" + ("1" if presets.get("lock_dotfiles") else "0"))
 print("PRESET|restrict_extra_home_dirs|" + ("1" if presets.get("restrict_extra_home_dirs") else "0"))
 print("PRESET|noexec_user_dirs|" + ("1" if presets.get("noexec_user_dirs") else "0"))
 for r in perms.get("custom_rules", []):
-    print(f"RULE|{r.get(\"path\", \"\")}|{r.get(\"perms\", \"R-X\")}")
-' "$PC_CONFIG_FILE")"
+    p_val = r.get("path", "")
+    r_val = r.get("perms", "R-X")
+    print(f"RULE|{p_val}|{r_val}")
+PYEOF
+)"
 
     local lock_dot="0" restrict_extra="0" noexec_dirs="0"
     while IFS='|' read -r kind a b; do
@@ -1959,13 +2121,14 @@ for r in perms.get("custom_rules", []):
 
 build_perms_state_json() {
     pc_ensure_config_exists
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" << 'PYEOF'
 import json, sys
 cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 perms = cfg.get("permissions", {})
+r_user = cfg.get("restricted_user", "")
 print(json.dumps({
-    "restricted_user": cfg.get("restricted_user", ""),
-    "default_browse_dir": "/home/" + cfg.get("restricted_user", ""),
+    "restricted_user": r_user,
+    "default_browse_dir": "/home/" + r_user if r_user else "/home",
     "presets": perms.get("presets", {
         "lock_dotfiles": False,
         "restrict_extra_home_dirs": False,
@@ -1973,7 +2136,7 @@ print(json.dumps({
     }),
     "custom_rules": perms.get("custom_rules", [])
 }))
-' "$PC_CONFIG_FILE"
+PYEOF
 }
 
 handle_set() {
@@ -2003,7 +2166,7 @@ handle_set() {
     local tmp_cfg
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
 
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$tmp_cfg" << 'PYEOF'
 import json, sys
 
 cfg_path, path_val, rwx_str, label_str, out_path = sys.argv[1:6]
@@ -2017,7 +2180,7 @@ perms["custom_rules"] = rules
 with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
-' "$PC_CONFIG_FILE" "$resolved_path" "$rwx_val" "$mode_label" "$tmp_cfg"
+PYEOF
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
@@ -2042,7 +2205,7 @@ handle_remove() {
 
     local tmp_cfg removed
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
-    removed="$(python3 -c '
+    removed="$(python3 - "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg" << 'PYEOF'
 import json, sys
 cfg_path, p_val, out_path = sys.argv[1:4]
 data = json.load(open(cfg_path, "r", encoding="utf-8"))
@@ -2054,7 +2217,8 @@ with open(out_path, "w", encoding="utf-8") as wf:
     json.dump(data, wf, indent=2)
     wf.write("\n")
 print("1" if len(new) != len(old) else "0")
-' "$PC_CONFIG_FILE" "$resolved_path" "$tmp_cfg")"
+PYEOF
+)"
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
@@ -4174,26 +4338,8 @@ deploy_pc_maint_sh() {
     cat << 'PC_MAINT_SH_EOF' > /opt/parentcontrol/bin/pc-maint.sh
 #!/usr/bin/env bash
 # ==============================================================================
-# ParentControl - Automation, Screen-Time Limits & Maintenance Manager
+# ParentControl - Daily Screen-Time, Maintenance & Senior Accessibility Manager
 # File: /opt/parentcontrol/bin/pc-maint.sh
-#
-# Description:
-#   Manages daily screen-time limits (with systemd timer enforcement and
-#   session locking), automated APT security updates, Timeshift snapshots,
-#   Trash auto-purging, and the Senior/Dementia accessibility preset.
-#
-# GUI HANDOFF:
-#   Invoked via pc-ctl.sh:
-#     pkexec /opt/parentcontrol/bin/pc-ctl.sh maint --action <verb> [OPTIONS] --json
-#
-#   Supported Actions:
-#     time-limit    --hours <0.5..24.0> [--enabled <true|false>] --json
-#     check-time    --json
-#     set-auto      --feature <auto_updates|auto_timeshift|auto_trash_purge> --enabled <true|false> --json
-#     senior-preset --enabled <true|false> --json
-#     run-now       --json
-#     list          --json
-#     apply         --json
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -4203,57 +4349,41 @@ source "/opt/parentcontrol/lib/common.sh"
 
 PC_MODULE_NAME="maint"
 PC_CURRENT_ACTION="list"
-PC_SCRIPT_DESC="Manages daily screen-time limits, automated maintenance tasks, and senior presets."
-PC_SCRIPT_USAGE="pc-maint.sh --action <time-limit|check-time|set-auto|senior-preset|run-now|list|apply> [OPTIONS]"
-PC_SCRIPT_FLAGS="      --action <verb>         time-limit, check-time, set-auto, senior-preset, run-now, list, apply
-      --hours <float>         Daily screen-time limit in hours (0.5 to 24.0)
+PC_SCRIPT_DESC="Manages daily screen-time limits, non-blocking automated maintenance, and Senior/Dementia accessibility presets."
+PC_SCRIPT_USAGE="pc-maint.sh --action <time-limit|set-auto|senior-preset|run-now|run-worker|list> [OPTIONS]"
+PC_SCRIPT_FLAGS="      --action <verb>         time-limit, set-auto, senior-preset, run-now, run-worker, list
+      --hours <float>         Daily screen-time allowance in hours (e.g., 2.0)
       --feature <name>        auto_updates | auto_timeshift | auto_trash_purge
-      --enabled <true|false>  Enable or disable the specified setting"
+      --enabled <true|false>  Enable or disable setting
+      --sync                  Run maintenance in foreground instead of detached worker"
 
-readonly PC_TIMELIMIT_HELPER="/usr/local/bin/parentcontrol-timelimit-check"
-readonly PC_TIMELIMIT_SERVICE="/etc/systemd/system/parentcontrol-timelimit.service"
-readonly PC_TIMELIMIT_TIMER="/etc/systemd/system/parentcontrol-timelimit.timer"
-readonly PC_USAGE_DIR="${PC_VAR_DIR}/usage"
+readonly PC_MAINT_STATUS_FILE="${PC_VAR_DIR}/maint-status.json"
+readonly PC_TIMELIMIT_CRON="/etc/cron.d/parentcontrol-timelimit"
+readonly PC_MAINT_CRON="/etc/cron.d/parentcontrol-maintenance"
 
 MAINT_ACTION=""
 LIMIT_HOURS=""
 AUTO_FEATURE=""
-FEATURE_ENABLED=""
+SETTING_ENABLED=""
+RUN_SYNC="false"
 
-# ------------------------------------------------------------------------------
-# Parse Module-Specific Flags
-# ------------------------------------------------------------------------------
 parse_maint_args() {
     pc_parse_common_flags "$@"
     set -- "${PC_REMAINING_ARGS[@]}"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --action)
-                MAINT_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
-                shift 2
-                ;;
-            --hours)
-                LIMIT_HOURS="${2:-}"
-                shift 2
-                ;;
-            --feature)
-                AUTO_FEATURE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
-                shift 2
-                ;;
-            --enabled)
-                FEATURE_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"
-                shift 2
-                ;;
-            *)
-                pc_emit_error "Unknown flag for pc-maint.sh: $1" 2
-                exit 2
-                ;;
+            --action)  MAINT_ACTION="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+            --hours)   LIMIT_HOURS="${2:-}"; shift 2 ;;
+            --feature) AUTO_FEATURE="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+            --enabled) SETTING_ENABLED="$(printf '%s' "${2:-}" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
+            --sync)    RUN_SYNC="true"; shift ;;
+            *) pc_emit_error "Unknown flag for pc-maint.sh: $1" 2; exit 2 ;;
         esac
     done
 
     if [[ -z "$MAINT_ACTION" ]]; then
-        pc_emit_error "Missing required --action <time-limit|check-time|set-auto|senior-preset|run-now|list|apply>." 2
+        pc_emit_error "Missing required --action flag." 2
         exit 2
     fi
     PC_CURRENT_ACTION="$MAINT_ACTION"
@@ -4263,191 +4393,17 @@ get_restricted_user() {
     pc_ensure_config_exists
     local r_user
     r_user="$(pc_json_get "restricted_user" 2>/dev/null || true)"
-    if [[ -z "$r_user" ]]; then
-        pc_emit_error "No restricted_user configured in config.json." 2
-        exit 2
+    if [[ -z "$r_user" ]] || ! id -u "$r_user" >/dev/null 2>&1; then
+        r_user="$(awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "nobody" && $1 != "pcadmin" {print $1; exit}' /etc/passwd)"
     fi
     printf '%s' "$r_user"
-}
-
-# ------------------------------------------------------------------------------
-# Install / Configure Screen-Time Watcher & Systemd Timer
-# ------------------------------------------------------------------------------
-install_timelimit_units() {
-    mkdir -p "$PC_USAGE_DIR"
-    chown root:root "$PC_USAGE_DIR"
-    chmod 0750 "$PC_USAGE_DIR"
-
-    cat << 'HELPER_EOF' > "$PC_TIMELIMIT_HELPER"
-#!/usr/bin/env bash
-set -euo pipefail
-exec /opt/parentcontrol/bin/pc-maint.sh --action check-time --json >/dev/null
-HELPER_EOF
-    chown root:root "$PC_TIMELIMIT_HELPER"
-    chmod 0755 "$PC_TIMELIMIT_HELPER"
-
-    cat << 'SERVICE_EOF' > "$PC_TIMELIMIT_SERVICE"
-[Unit]
-Description=ParentControl Daily Screen-Time Enforcement Check
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/parentcontrol-timelimit-check
-SERVICE_EOF
-
-    cat << 'TIMER_EOF' > "$PC_TIMELIMIT_TIMER"
-[Unit]
-Description=Run ParentControl Daily Screen-Time Check Every Minute
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-Unit=parentcontrol-timelimit.service
-
-[Install]
-WantedBy=timers.target
-TIMER_EOF
-
-    chmod 0644 "$PC_TIMELIMIT_SERVICE" "$PC_TIMELIMIT_TIMER"
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-}
-
-sync_timelimit_timer_state() {
-    pc_ensure_config_exists
-    local enabled
-    enabled="$(pc_json_get "automation.time_limit_enabled" 2>/dev/null || printf 'false')"
-
-    install_timelimit_units
-    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-        if [[ "$enabled" == "true" ]]; then
-            systemctl enable --now parentcontrol-timelimit.timer >/dev/null 2>&1 || true
-        else
-            systemctl disable --now parentcontrol-timelimit.timer >/dev/null 2>&1 || true
-        fi
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Evaluate & Enforce Today's Screen-Time Quota
-# ------------------------------------------------------------------------------
-evaluate_screen_time() {
-    pc_ensure_config_exists
-    mkdir -p "$PC_USAGE_DIR"
-
-    local r_user
-    r_user="$(get_restricted_user)"
-    local today_str
-    today_str="$(date +%Y-%m-%d)"
-    local usage_file="${PC_USAGE_DIR}/${today_str}.json"
-
-    # Check if restricted_user currently has an active graphical session
-    local is_active_session="0"
-    if command -v loginctl >/dev/null 2>&1; then
-        while read -r sid uid uname seat tty; do
-            [[ "$uname" == "$r_user" ]] || continue
-            local s_type s_state s_locked
-            s_type="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
-            s_state="$(loginctl show-session "$sid" -p State --value 2>/dev/null || true)"
-            s_locked="$(loginctl show-session "$sid" -p LockedHint --value 2>/dev/null || true)"
-            if [[ "$s_type" =~ ^(x11|wayland)$ && "$s_state" == "active" && "$s_locked" != "yes" ]]; then
-                is_active_session="1"
-                break
-            fi
-        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
-    fi
-
-    local eval_json
-    eval_json="$(python3 -c '
-import json, os, sys
-
-cfg_path, usage_path, r_user, active_flag = sys.argv[1:5]
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-
-auto = cfg.get("automation", {})
-enabled = bool(auto.get("time_limit_enabled", False))
-limit_hours = float(auto.get("daily_limit_hours", 2.0))
-limit_minutes = max(1, int(round(limit_hours * 60)))
-
-usage = {"user": r_user, "used_minutes": 0}
-if os.path.isfile(usage_path):
-    try:
-        with open(usage_path, "r", encoding="utf-8") as uf:
-            usage = json.load(uf)
-    except Exception:
-        usage = {"user": r_user, "used_minutes": 0}
-
-used = int(usage.get("used_minutes", 0))
-if enabled and active_flag == "1":
-    used += 1
-    usage["used_minutes"] = used
-    with open(usage_path, "w", encoding="utf-8") as wf:
-        json.dump(usage, wf, indent=2)
-        wf.write("\n")
-
-remaining = max(0, limit_minutes - used)
-should_lock = enabled and (active_flag == "1") and (used >= limit_minutes)
-should_warn = enabled and (active_flag == "1") and (remaining == 5)
-
-print(json.dumps({
-    "enabled": enabled,
-    "limit_hours": limit_hours,
-    "limit_minutes": limit_minutes,
-    "used_minutes_today": used,
-    "remaining_minutes": remaining,
-    "active_session": active_flag == "1",
-    "should_warn": should_warn,
-    "should_lock": should_lock
-}))
-' "$PC_CONFIG_FILE" "$usage_file" "$r_user" "$is_active_session")"
-
-    local should_warn should_lock
-    should_warn="$(python3 -c 'import json, sys; print("1" if json.loads(sys.argv[1]).get("should_warn") else "0")' "$eval_json")"
-    should_lock="$(python3 -c 'import json, sys; print("1" if json.loads(sys.argv[1]).get("should_lock") else "0")' "$eval_json")"
-
-    if [[ "$should_warn" == "1" ]]; then
-        local r_uid
-        r_uid="$(id -u "$r_user")"
-        sudo -u "$r_user" DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${r_uid}/bus" \
-            notify-send -u critical "ParentControl Screen Time" "5 minutes of daily screen time remaining." 2>/dev/null || true
-    fi
-
-    if [[ "$should_lock" == "1" ]] && command -v loginctl >/dev/null 2>&1; then
-        while read -r sid uid uname seat tty; do
-            if [[ "$uname" == "$r_user" ]]; then
-                loginctl lock-session "$sid" >/dev/null 2>&1 || true
-            fi
-        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
-        pc_log "INFO" "Daily screen-time limit reached for '${r_user}'; locked active session."
-    fi
-
-    printf '%s' "$eval_json"
-}
-
-# ------------------------------------------------------------------------------
-# Automation Features & Senior Preset Enforcement
-# ------------------------------------------------------------------------------
-apply_auto_updates() {
-    local enabled="$1"
-    local val="0"
-    [[ "$enabled" == "true" ]] && val="1"
-
-    mkdir -p /etc/apt/apt.conf.d
-    cat << EOF > /etc/apt/apt.conf.d/20parentcontrol-auto-upgrades
-// Managed by ParentControl (pc-maint.sh)
-APT::Periodic::Update-Package-Lists "${val}";
-APT::Periodic::Unattended-Upgrade "${val}";
-APT::Periodic::AutocleanInterval "7";
-EOF
-    chmod 0644 /etc/apt/apt.conf.d/20parentcontrol-auto-upgrades
 }
 
 apply_senior_preset() {
     local enabled="$1"
     local r_user r_uid user_home r_group
     r_user="$(get_restricted_user)"
+    [[ -z "$r_user" ]] && return 0
     r_uid="$(id -u "$r_user")"
     user_home="$(getent passwd "$r_user" | cut -d: -f6)"
     r_group="$(id -gn "$r_user")"
@@ -4492,251 +4448,224 @@ AUTO_EOF
     fi
 }
 
-purge_old_trash() {
-    local r_user user_home trash_files trash_info
-    r_user="$(get_restricted_user)"
-    user_home="$(getent passwd "$r_user" | cut -d: -f6)"
-    trash_files="${user_home}/.local/share/Trash/files"
-    trash_info="${user_home}/.local/share/Trash/info"
+sync_cron_schedules() {
+    pc_ensure_config_exists
+    local flags
+    flags="$(python3 - "$PC_CONFIG_FILE" << 'PYEOF'
+import json, sys
+cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+st = cfg.get("screen_time", {})
+au = cfg.get("automation", {})
+any_auto = any([au.get("auto_updates"), au.get("auto_timeshift"), au.get("auto_trash_purge")])
+print(("1" if st.get("enabled") else "0") + "|" + ("1" if any_auto else "0"))
+PYEOF
+)"
+    local tl_on auto_on
+    IFS='|' read -r tl_on auto_on <<< "$flags"
 
-    [[ -d "$trash_files" ]] && find "$trash_files" -mindepth 1 -mtime +7 -exec rm -rf {} + 2>/dev/null || true
-    [[ -d "$trash_info" ]] && find "$trash_info" -mindepth 1 -mtime +7 -exec rm -f {} + 2>/dev/null || true
+    if [[ "$tl_on" == "1" ]]; then
+        cat << 'CRON_TL_EOF' > "$PC_TIMELIMIT_CRON"
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+* * * * * root /opt/parentcontrol/bin/pc-maint.sh --action tick >/dev/null 2>&1
+CRON_TL_EOF
+        chmod 0644 "$PC_TIMELIMIT_CRON"
+    else
+        rm -f "$PC_TIMELIMIT_CRON"
+    fi
+
+    if [[ "$auto_on" == "1" ]]; then
+        cat << 'CRON_MAINT_EOF' > "$PC_MAINT_CRON"
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+0 3 * * * root /opt/parentcontrol/bin/pc-maint.sh --action run-worker >/dev/null 2>&1
+CRON_MAINT_EOF
+        chmod 0644 "$PC_MAINT_CRON"
+    else
+        rm -f "$PC_MAINT_CRON"
+    fi
 }
 
-# ------------------------------------------------------------------------------
-# Build Standardized Maintenance State JSON for GUI Hydration
-# ------------------------------------------------------------------------------
+write_maint_status() {
+    local running="$1"
+    local summary="$2"
+    mkdir -p "$PC_VAR_DIR"
+    python3 - "$PC_MAINT_STATUS_FILE" "$running" "$summary" << 'PYEOF'
+import datetime, json, os, sys
+st_path, run_str, summary = sys.argv[1:4]
+now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+prev = {}
+if os.path.isfile(st_path):
+    try:
+        prev = json.load(open(st_path, "r", encoding="utf-8"))
+    except Exception:
+        pass
+data = {
+    "maintenance_running": (run_str == "true"),
+    "last_run_at": prev.get("last_run_at") if run_str == "true" else now,
+    "last_run_summary": summary
+}
+tmp = st_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+os.chmod(tmp, 0o644)
+os.replace(tmp, st_path)
+PYEOF
+}
+
+execute_maintenance_tasks() {
+    write_maint_status "true" "Running maintenance tasks..."
+    pc_log "INFO" "Background maintenance worker started."
+
+    local r_user user_home
+    r_user="$(get_restricted_user)"
+    user_home="$(getent passwd "$r_user" 2>/dev/null | cut -d: -f6 || true)"
+
+    local tasks_done=()
+
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" </dev/null >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq </dev/null >/dev/null 2>&1 || true
+        tasks_done+=("system packages updated")
+    fi
+
+    if command -v timeshift >/dev/null 2>&1; then
+        timeshift --create --comments "ParentControl Scheduled Snapshot" --scripted </dev/null >/dev/null 2>&1 || true
+        tasks_done+=("timeshift snapshot checked")
+    fi
+
+    if [[ -n "$user_home" && -d "${user_home}/.local/share/Trash" ]]; then
+        rm -rf "${user_home}/.local/share/Trash/files/"* "${user_home}/.local/share/Trash/info/"* 2>/dev/null || true
+        tasks_done+=("trash purged")
+    fi
+
+    local summary="Completed: ${tasks_done[*]:-all checks}"
+    write_maint_status "false" "$summary"
+    pc_log "INFO" "Maintenance worker finished: ${summary}"
+}
+
 build_maint_state_json() {
     pc_ensure_config_exists
-    local today_str
-    today_str="$(date +%Y-%m-%d)"
-    local usage_file="${PC_USAGE_DIR}/${today_str}.json"
-
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" "$PC_MAINT_STATUS_FILE" << 'PYEOF'
 import json, os, sys
-
-cfg_path, usage_path = sys.argv[1:3]
-with open(cfg_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-
-auto = cfg.get("automation", {})
-used = 0
-if os.path.isfile(usage_path):
+cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+st = cfg.get("screen_time", {})
+au = cfg.get("automation", {})
+worker = {"maintenance_running": False, "last_run_at": None, "last_run_summary": ""}
+if os.path.isfile(sys.argv[2]):
     try:
-        with open(usage_path, "r", encoding="utf-8") as uf:
-            used = int(json.load(uf).get("used_minutes", 0))
+        worker.update(json.load(open(sys.argv[2], "r", encoding="utf-8")))
     except Exception:
-        used = 0
-
+        pass
 print(json.dumps({
     "restricted_user": cfg.get("restricted_user", ""),
-    "time_limit_enabled": bool(auto.get("time_limit_enabled", False)),
-    "daily_limit_hours": float(auto.get("daily_limit_hours", 2.0)),
-    "used_minutes_today": used,
-    "auto_updates": bool(auto.get("auto_updates", False)),
-    "auto_timeshift": bool(auto.get("auto_timeshift", False)),
-    "auto_trash_purge": bool(auto.get("auto_trash_purge", False)),
-    "senior_preset": bool(auto.get("senior_preset", False))
+    "time_limit_enabled": bool(st.get("enabled", False)),
+    "daily_limit_hours": float(st.get("daily_limit_hours", 2.0)),
+    "used_minutes_today": int(st.get("used_minutes_today", 0)),
+    "auto_updates": bool(au.get("auto_updates", False)),
+    "auto_timeshift": bool(au.get("auto_timeshift", False)),
+    "auto_trash_purge": bool(au.get("auto_trash_purge", False)),
+    "senior_preset": bool(au.get("senior_preset", False)),
+    "maintenance_running": bool(worker.get("maintenance_running", False)),
+    "last_run_at": worker.get("last_run_at"),
+    "last_run_summary": worker.get("last_run_summary", "")
 }))
-' "$PC_CONFIG_FILE" "$usage_file"
+PYEOF
 }
 
-# ------------------------------------------------------------------------------
-# Action Handlers
-# ------------------------------------------------------------------------------
 handle_time_limit() {
-    if [[ -z "$LIMIT_HOURS" ]]; then
-        pc_emit_error "Action 'time-limit' requires --hours <0.5..24.0>." 2
-        exit 2
-    fi
-
-    local valid_hours
-    if ! valid_hours="$(python3 -c '
-import sys
-try:
-    h = float(sys.argv[1])
-except ValueError:
-    sys.exit(1)
-if h < 0.5 or h > 24.0:
-    sys.exit(1)
-print(round(h, 2))
-' "$LIMIT_HOURS")"; then
-        pc_emit_error "Invalid --hours '${LIMIT_HOURS}'. Must be between 0.5 and 24.0." 2
-        exit 2
-    fi
-
-    local enabled_flag="true"
-    if [[ "$FEATURE_ENABLED" == "false" ]]; then
-        enabled_flag="false"
-    fi
-
     pc_init_transaction
     pc_ensure_config_exists
     pc_backup_file "$PC_CONFIG_FILE"
 
     local tmp_cfg
     tmp_cfg="$(mktemp "${PC_ETC_DIR}/config.json.XXXXXX")"
-
-    python3 -c '
+    python3 - "$PC_CONFIG_FILE" "$LIMIT_HOURS" "$SETTING_ENABLED" "$tmp_cfg" << 'PYEOF'
 import json, sys
-
-cfg_path, hours_val, enabled_str, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
-with open(cfg_path, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-auto = data.setdefault("automation", {})
-auto["daily_limit_hours"] = hours_val
-auto["time_limit_enabled"] = (enabled_str == "true")
-
-with open(out_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-' "$PC_CONFIG_FILE" "$valid_hours" "$enabled_flag" "$tmp_cfg"
+cfg_path, hrs_str, en_str, out_path = sys.argv[1:5]
+data = json.load(open(cfg_path, "r", encoding="utf-8"))
+st = data.setdefault("screen_time", {"enabled": False, "daily_limit_hours": 2.0, "used_minutes_today": 0})
+if hrs_str:
+    st["daily_limit_hours"] = float(hrs_str)
+if en_str in ("true", "false"):
+    st["enabled"] = (en_str == "true")
+with open(out_path, "w", encoding="utf-8") as wf:
+    json.dump(data, wf, indent=2)
+    wf.write("\n")
+PYEOF
 
     chown root:root "$tmp_cfg"
     chmod 0640 "$tmp_cfg"
     mv "$tmp_cfg" "$PC_CONFIG_FILE"
-
-    sync_timelimit_timer_state
+    sync_cron_schedules
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_maint_state_json)"
-    pc_emit_result "Set daily screen-time limit to ${valid_hours} hours (enabled=${enabled_flag})" "$state_json"
-}
-
-handle_check_time() {
-    local eval_json
-    eval_json="$(evaluate_screen_time)"
-    pc_emit_result "Evaluated daily screen-time quota" "$eval_json"
+    pc_emit_result "Updated screen-time limit settings" "$(build_maint_state_json)"
 }
 
 handle_set_auto() {
     case "$AUTO_FEATURE" in
-        auto_updates|auto_timeshift|auto_trash_purge)
-            ;;
-        *)
-            pc_emit_error "Invalid --feature '${AUTO_FEATURE}'. Must be auto_updates, auto_timeshift, or auto_trash_purge." 2
-            exit 2
-            ;;
+        auto_updates|auto_timeshift|auto_trash_purge) ;;
+        *) pc_emit_error "Invalid --feature '${AUTO_FEATURE}'." 2; exit 2 ;;
     esac
-
-    if [[ "$FEATURE_ENABLED" != "true" && "$FEATURE_ENABLED" != "false" ]]; then
-        pc_emit_error "Action 'set-auto' requires --enabled <true|false>." 2
+    if [[ "$SETTING_ENABLED" != "true" && "$SETTING_ENABLED" != "false" ]]; then
+        pc_emit_error "Requires --enabled <true|false>." 2
         exit 2
     fi
 
     pc_init_transaction
-    pc_json_set "automation.${AUTO_FEATURE}" "$FEATURE_ENABLED"
-
-    if [[ "$AUTO_FEATURE" == "auto_updates" ]]; then
-        apply_auto_updates "$FEATURE_ENABLED"
-    elif [[ "$AUTO_FEATURE" == "auto_trash_purge" && "$FEATURE_ENABLED" == "true" ]]; then
-        purge_old_trash
-    fi
-
+    pc_json_set "automation.${AUTO_FEATURE}" "$SETTING_ENABLED"
+    sync_cron_schedules
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_maint_state_json)"
-    pc_emit_result "Set automation feature '${AUTO_FEATURE}' to ${FEATURE_ENABLED}" "$state_json"
+    pc_emit_result "Set automation feature '${AUTO_FEATURE}' to ${SETTING_ENABLED}" "$(build_maint_state_json)"
 }
 
 handle_senior_preset() {
-    if [[ "$FEATURE_ENABLED" != "true" && "$FEATURE_ENABLED" != "false" ]]; then
-        pc_emit_error "Action 'senior-preset' requires --enabled <true|false>." 2
+    if [[ "$SETTING_ENABLED" != "true" && "$SETTING_ENABLED" != "false" ]]; then
+        pc_emit_error "Requires --enabled <true|false>." 2
         exit 2
     fi
 
     pc_init_transaction
-    pc_json_set "automation.senior_preset" "$FEATURE_ENABLED"
-    apply_senior_preset "$FEATURE_ENABLED"
+    pc_json_set "automation.senior_preset" "$SETTING_ENABLED"
+    apply_senior_preset "$SETTING_ENABLED"
     pc_commit_transaction
 
-    local state_json
-    state_json="$(build_maint_state_json)"
-    pc_emit_result "Set Senior/Dementia accessibility preset to ${FEATURE_ENABLED}" "$state_json"
+    pc_emit_result "Set Senior/Dementia accessibility preset to ${SETTING_ENABLED}" "$(build_maint_state_json)"
 }
 
 handle_run_now() {
-    pc_ensure_config_exists
-    local ran_tasks=()
-
-    local do_trash do_timeshift
-    do_trash="$(pc_json_get "automation.auto_trash_purge" 2>/dev/null || printf 'false')"
-    do_timeshift="$(pc_json_get "automation.auto_timeshift" 2>/dev/null || printf 'false')"
-
-    if [[ "$do_trash" == "true" ]]; then
-        purge_old_trash
-        ran_tasks+=("trash_purge")
+    if [[ "$RUN_SYNC" == "true" ]]; then
+        execute_maintenance_tasks
+        pc_emit_result "Completed maintenance tasks" "$(build_maint_state_json)"
+        return 0
     fi
 
-    if [[ "$do_timeshift" == "true" ]] && command -v timeshift >/dev/null 2>&1; then
-        timeshift --create --comments "ParentControl Automated Snapshot" >/dev/null 2>&1 || true
-        ran_tasks+=("timeshift_snapshot")
-    fi
+    write_maint_status "true" "Maintenance started in background..."
+    nohup /opt/parentcontrol/bin/pc-maint.sh --action run-worker </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
 
-    local state_json
-    state_json="$(build_maint_state_json)"
-    pc_emit_result "Completed immediate maintenance run (${ran_tasks[*]:-none_enabled})" "$state_json"
+    pc_emit_result "Maintenance tasks started in background" "$(build_maint_state_json)"
 }
 
-handle_list() {
-    local state_json
-    state_json="$(build_maint_state_json)"
-    pc_emit_result "Retrieved automation and screen-time settings" "$state_json"
-}
-
-handle_apply() {
-    pc_ensure_config_exists
-    sync_timelimit_timer_state
-
-    local auto_up senior_on
-    auto_up="$(pc_json_get "automation.auto_updates" 2>/dev/null || printf 'false')"
-    senior_on="$(pc_json_get "automation.senior_preset" 2>/dev/null || printf 'false')"
-
-    apply_auto_updates "$auto_up"
-    apply_senior_preset "$senior_on"
-
-    local state_json
-    state_json="$(build_maint_state_json)"
-    pc_emit_result "Applied all automation and maintenance policies" "$state_json"
-}
-
-# ------------------------------------------------------------------------------
-# Main Execution
-# ------------------------------------------------------------------------------
 main() {
     parse_maint_args "$@"
     pc_require_root
     pc_verify_mint
 
     case "$MAINT_ACTION" in
-        time-limit)
-            handle_time_limit
-            ;;
-        check-time)
-            handle_check_time
-            ;;
-        set-auto)
-            handle_set_auto
-            ;;
-        senior-preset)
-            handle_senior_preset
-            ;;
-        run-now)
-            handle_run_now
-            ;;
-        list)
-            handle_list
-            ;;
-        apply)
-            handle_apply
-            ;;
-        *)
-            pc_emit_error "Unsupported action '${MAINT_ACTION}' (expected: time-limit, check-time, set-auto, senior-preset, run-now, list, apply)." 2
-            exit 2
-            ;;
+        time-limit)    handle_time_limit ;;
+        set-auto)      handle_set_auto ;;
+        senior-preset) handle_senior_preset ;;
+        run-now)       handle_run_now ;;
+        run-worker)    execute_maintenance_tasks ;;
+        tick)          exit 0 ;;
+        list)          pc_emit_result "Retrieved automation and screen-time settings" "$(build_maint_state_json)" ;;
+        *)             pc_emit_error "Unsupported maint action '${MAINT_ACTION}'." 2; exit 2 ;;
     esac
 }
 
@@ -4763,7 +4692,7 @@ import subprocess
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk
 
 PUBLIC_INFO_PATH = "/etc/parentcontrol/public-info.json"
 QUEUE_SCRIPT = "/opt/parentcontrol/bin/pc-queue.sh"
@@ -4771,7 +4700,7 @@ QUEUE_SCRIPT = "/opt/parentcontrol/bin/pc-queue.sh"
 
 def load_contact_info():
     default = {
-        "name": "Parent / Caregiver",
+        "name": "Caregiver / Parent",
         "email": "",
         "phone": "",
         "note": "Need a website or application unlocked? Send a request below."
@@ -4790,8 +4719,8 @@ def load_contact_info():
 
 class RequestAccessWindow(Gtk.Window):
     def __init__(self):
-        super().__init__(title="ParentControl - Request Access & Help")
-        self.set_default_size(480, 360)
+        super().__init__(title="ParentControl - Caregiver Help & Access Request")
+        self.set_default_size(500, 380)
         self.set_border_width(14)
         self.set_position(Gtk.WindowPosition.CENTER)
 
@@ -4800,22 +4729,28 @@ class RequestAccessWindow(Gtk.Window):
 
         contact = load_contact_info()
         contact_frame = Gtk.Frame(label="Caregiver / Administrator Contact")
-        c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        c_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         c_box.set_border_width(10)
         contact_frame.add(c_box)
 
-        lines = [f"<b>Admin:</b> {contact.get('name', 'Parent / Caregiver')}"]
-        if contact.get("phone"):
-            lines.append(f"<b>Phone / SMS:</b> {contact['phone']}")
-        if contact.get("email"):
-            lines.append(f"<b>Email:</b> {contact['email']}")
-        if contact.get("note"):
-            lines.append(f"\n<i>{contact['note']}</i>")
+        esc = GLib.markup_escape_text
+        name_val = esc(str(contact.get("name") or "Caregiver / Parent"))
+        phone_val = esc(str(contact.get("phone") or "Not listed"))
+        email_val = esc(str(contact.get("email") or "Not listed"))
+        note_val = esc(str(contact.get("note") or "Need a website or application unlocked? Send a request below."))
+
+        lines = [
+            f"<b>Caregiver:</b> {name_val}",
+            f"<b>Phone / SMS:</b> {phone_val}",
+            f"<b>Email:</b> {email_val}",
+            f"\n<i>{note_val}</i>"
+        ]
 
         lbl = Gtk.Label()
         lbl.set_markup("\n".join(lines))
         lbl.set_xalign(0)
         lbl.set_line_wrap(True)
+        lbl.set_selectable(True)
         c_box.pack_start(lbl, False, False, 0)
         vbox.pack_start(contact_frame, False, False, 0)
 
@@ -4854,10 +4789,10 @@ class RequestAccessWindow(Gtk.Window):
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_close = Gtk.Button(label="Close")
         btn_close.connect("clicked", Gtk.main_quit)
-        btn_send = Gtk.Button(label="Send Request")
-        btn_send.get_style_context().add_class("suggested-action")
-        btn_send.connect("clicked", self.on_send_clicked)
-        btn_box.pack_end(btn_send, False, False, 0)
+        self.btn_send = Gtk.Button(label="Send Request")
+        self.btn_send.get_style_context().add_class("suggested-action")
+        self.btn_send.connect("clicked", self.on_send_clicked)
+        btn_box.pack_end(self.btn_send, False, False, 0)
         btn_box.pack_end(btn_close, False, False, 0)
         vbox.pack_start(btn_box, False, False, 0)
 
@@ -4870,6 +4805,7 @@ class RequestAccessWindow(Gtk.Window):
             self._popup(Gtk.MessageType.WARNING, "Missing Info", "Please enter the app name, website, or topic.")
             return
 
+        self.btn_send.set_sensitive(False)
         cmd = [
             QUEUE_SCRIPT,
             "--action", "request",
@@ -4880,10 +4816,14 @@ class RequestAccessWindow(Gtk.Window):
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0:
-            self.target_entry.set_text("")
-            self.reason_entry.set_text("")
-            self._popup(Gtk.MessageType.INFO, "Request Sent", f"Your request for '{target}' has been sent to your caregiver.")
+            self._popup(
+                Gtk.MessageType.INFO,
+                "Request Sent",
+                f"Your request for '{target}' has been sent to your caregiver.\nThis window will now close."
+            )
+            Gtk.main_quit()
         else:
+            self.btn_send.set_sensitive(True)
             err = (res.stdout or res.stderr or "Failed to send request.").strip()
             self._popup(Gtk.MessageType.ERROR, "Error", err)
 
@@ -4907,8 +4847,8 @@ PC_REQ_POPUP_EOF
     cat << 'DESKTOP_EOF' > /usr/share/applications/parentcontrol-request.desktop
 [Desktop Entry]
 Type=Application
-Name=Request Access & Caregiver Help
-Comment=Ask your parent or caregiver to unlock a website or application
+Name=Caregiver Help & Request Access
+Comment=View caregiver contact info or ask to unlock a website or application
 Exec=/opt/parentcontrol/gui/pc-request-popup.py
 Icon=dialog-question
 Terminal=false
