@@ -501,7 +501,7 @@ def _load_permissions(self):
         finally:
             self._loading = False
 
-    def _toggle_rwx_preset(self, chk, preset_name):
+def _toggle_rwx_preset(self, chk, preset_name):
         if self._loading:
             return
         state = 'true' if chk.get_active() else 'false'
@@ -513,7 +513,7 @@ def _load_permissions(self):
             self._loading = False
             self._show_msg(Gtk.MessageType.ERROR, 'Preset Error', str(exc))
 
-    def _browse_directory(self, widget):
+def _browse_directory(self, widget):
         dialog = Gtk.FileChooserDialog(
             title='Select Folder', parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER
         )
@@ -525,7 +525,7 @@ def _load_permissions(self):
             self.dir_entry.set_text(dialog.get_filename())
         dialog.destroy()
 
-    def _apply_rwx(self, widget):
+def _apply_rwx(self, widget):
         target = self.dir_entry.get_text().strip()
         mode_idx = self.mode_combo.get_active()
         if not target:
@@ -541,7 +541,7 @@ def _load_permissions(self):
             self._show_msg(Gtk.MessageType.ERROR, 'Permissions Error', str(exc))
 
 
-    def _remove_rwx_rule(self, widget):
+def _remove_rwx_rule(self, widget):
         selection = self.rwx_tree.get_selection()
         model, treeiter = selection.get_selected()
         if not treeiter: return
@@ -553,7 +553,7 @@ def _load_permissions(self):
             self._show_msg(Gtk.MessageType.ERROR, 'Permissions Error', str(exc))
 
     # --- DEVICES TAB ---
-    def _build_device_tab(self):
+def _build_device_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -578,7 +578,7 @@ def _load_permissions(self):
         box.pack_start(frame, True, True, 0)
         self.notebook.append_page(box, Gtk.Label(label='Devices'))
 
-    def _load_devices(self):
+def _load_devices(self):
         try:
             payload = self._backend_command('devices', '--action', 'list').get('data', {})
             self.device_states = payload.get('devices', {})
@@ -587,7 +587,7 @@ def _load_permissions(self):
         except Exception as exc:
             logging.exception('Devices Load Error: %s', exc)
 
-    def _apply_device_rules(self, widget):
+def _apply_device_rules(self, widget):
         try:
             for key, check in self.device_checks.items():
                 active = check.get_active()
@@ -599,7 +599,7 @@ def _load_permissions(self):
             self._show_msg(Gtk.MessageType.ERROR, 'Devices Error', str(exc))
 
    # --- APPS TAB ---
-    def _build_apps_tab(self):
+def _build_apps_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -646,7 +646,7 @@ def _load_permissions(self):
 
         self.notebook.append_page(box, Gtk.Label(label='Applications'))
 
-    def _populate_apps_list(self, apps):
+def _populate_apps_list(self, apps):
         """Helper to populate the TreeView from an apps array."""
         self.apps_store.clear()
         for app in apps:
@@ -661,7 +661,7 @@ def _load_permissions(self):
             if name:
                 self.apps_store.append([is_allowed, desktop_id, name, exec_cmd])
 
-    def _load_apps(self):
+def _load_apps(self):
         self._loading = True
         try:
             payload = self._backend_command('apps', '--action', 'list').get('data', {})
@@ -674,7 +674,7 @@ def _load_permissions(self):
         finally:
             self._loading = False
 
-    def _scan_apps(self, widget):
+def _scan_apps(self, widget):
         try:
             payload = self._backend_command('apps', '--action', 'scan').get('data', {})
             apps = payload.get('applications', [])
@@ -683,7 +683,7 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Scan Error', str(exc))
 
-    def _on_app_toggled(self, widget, path):
+def _on_app_toggled(self, widget, path):
         # Invert the current boolean value in the store
         current_state = self.apps_store[path][0]
         new_state = not current_state
@@ -700,7 +700,7 @@ def _load_permissions(self):
             self.apps_store[path][0] = current_state
             self._show_msg(Gtk.MessageType.ERROR, 'App Rule Error', str(exc))
 
-    def _on_lock_installers_toggle(self, switch, gparam):
+def _on_lock_installers_toggle(self, switch, gparam):
         if self._loading: return
         state = 'true' if switch.get_active() else 'false'
         try:
@@ -708,7 +708,7 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'App Error', str(exc))
     # --- QUEUE TAB ---
-    def _build_queue_tab(self):
+def _build_queue_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -747,7 +747,7 @@ def _load_permissions(self):
         box.pack_start(action_box, False, False, 0)
         self.notebook.append_page(box, Gtk.Label(label='Approvals Queue'))
 
-    def _load_queue(self):
+def _load_queue(self):
         try:
             payload = self._backend_command('queue', '--action', 'list').get('data', {})
             self.queue_store.clear()
@@ -760,7 +760,7 @@ def _load_permissions(self):
         except Exception as exc:
             logging.exception('Queue Load Error: %s', exc)
 
-    def _handle_queue_action(self, action):
+def _handle_queue_action(self, action):
         selection = self.queue_tree.get_selection()
         model, treeiter = selection.get_selected()
         if not treeiter: return
@@ -772,7 +772,7 @@ def _load_permissions(self):
             self._show_msg(Gtk.MessageType.ERROR, 'Queue Error', str(exc))
 
     # --- MAINT TAB ---
-    def _build_maint_tab(self):
+def _build_maint_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -827,7 +827,7 @@ def _load_permissions(self):
         box.pack_start(auto_frame, False, False, 0)
         self.notebook.append_page(box, Gtk.Label(label='Automation & Access'))
 
-    def _load_maint(self):
+def _load_maint(self):
         self._loading = True
         try:
             payload = self._backend_command('maint', '--action', 'list').get('data', {})
@@ -843,7 +843,7 @@ def _load_permissions(self):
         finally:
             self._loading = False
 
-    def _on_senior_preset(self, switch, gparam):
+def _on_senior_preset(self, switch, gparam):
         if self._loading: return
         state = 'true' if switch.get_active() else 'false'
         try:
@@ -851,7 +851,7 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Preset Error', str(exc))
 
-    def _apply_time_limit(self, widget):
+def _apply_time_limit(self, widget):
         state = 'true' if self.time_limit_switch.get_active() else 'false'
         hours = str(self.time_limit_spin.get_value())
         try:
@@ -861,7 +861,7 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Time Limit Error', str(exc))
 
-    def _toggle_auto_feature(self, chk, feature):
+def _toggle_auto_feature(self, chk, feature):
         if self._loading: return
         state = 'true' if chk.get_active() else 'false'
         try:
@@ -869,7 +869,7 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Maint Error', str(exc))
 
-    def _run_maint_now(self):
+def _run_maint_now(self):
         try:
             # Backend handles detachment now; will return near-instantly without freezing GTK
             self._backend_command('maint', '--action', 'run-now')
@@ -878,7 +878,7 @@ def _load_permissions(self):
             self._show_msg(Gtk.MessageType.ERROR, 'Maint Error', str(exc))
 
     # --- SETUP TAB ---
-    def _build_setup_tab(self):
+def _build_setup_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.set_border_width(10)
 
@@ -945,7 +945,7 @@ def _load_permissions(self):
         
         self.notebook.append_page(box, Gtk.Label(label='Setup & Caregiver'))
 
-    def _load_setup(self):
+def _load_setup(self):
         try:
             payload = self._backend_command('status', '--action', 'check').get('data', {})
             self.setup_user_entry.set_text(payload.get('restricted_user', ''))
@@ -957,7 +957,7 @@ def _load_permissions(self):
         except Exception as exc:
             logging.exception('Setup Load Error: %s', exc)
 
-    def _apply_admin_setup(self, widget):
+def _apply_admin_setup(self, widget):
         user = self.setup_user_entry.get_text().strip()
         pw1 = self.setup_pw_entry.get_text()
         pw2 = self.setup_pw2_entry.get_text()
@@ -979,14 +979,14 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Setup Error', str(exc))
 
-    def _restore_user_sudo(self, widget):
+def _restore_user_sudo(self, widget):
         try:
             self._backend_command('setup', '--action', 'restore-admin')
             self._show_msg(Gtk.MessageType.INFO, 'Success', 'User sudo restored.')
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Restore Error', str(exc))
 
-    def _save_contact(self, widget):
+def _save_contact(self, widget):
         name = self.contact_entries['name'].get_text()
         phone = self.contact_entries['phone'].get_text()
         email = self.contact_entries['email'].get_text()
@@ -998,7 +998,7 @@ def _load_permissions(self):
             self._show_msg(Gtk.MessageType.ERROR, 'Contact Error', str(exc))
 
     # --- STATUS TAB ---
-    def _build_status_tab(self):
+def _build_status_tab(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.set_border_width(10)
 
@@ -1038,7 +1038,7 @@ def _load_permissions(self):
 
         self.notebook.append_page(box, Gtk.Label(label='Status & Logs'))
 
-    def _refresh_status(self):
+def _refresh_status(self):
         try:
             payload = self._backend_command('status', '--action', 'check').get('data', {})
             lines = [
@@ -1058,7 +1058,7 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Status Error', str(exc))
 
-    def _load_full_logs(self, widget):
+def _load_full_logs(self, widget):
         try:
             payload = self._backend_command('logs', '--action', 'read', '--lines', '100').get('data', {})
             buf = self.log_textview.get_buffer()
@@ -1066,14 +1066,14 @@ def _load_permissions(self):
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Log Error', str(exc))
 
-    def _clear_logs(self, widget):
+def _clear_logs(self, widget):
         try:
             self._backend_command('logs', '--action', 'clear')
             self._refresh_status()
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Log Error', str(exc))
 
-    def refresh_all(self):
+def refresh_all(self):
         self._load_acl_rules()
         self._load_ports()
         self._load_permissions()
