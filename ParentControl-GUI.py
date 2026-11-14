@@ -147,31 +147,36 @@ class ParentControlApp(Gtk.Window):
         box.set_border_width(10)
 
         # Feed Controls
-        feed_frame = Gtk.Frame(label='Default Blocklist Feed')
-        feed_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        feed_box.set_border_width(10)
+        feed_frame = Gtk.Frame(label='Blocklist Feeds')
         
-        self.feed_switch = Gtk.Switch()
-        self.feed_switch.connect('notify::active', self._on_feed_toggle)
-        feed_box.pack_start(Gtk.Label(label='Enable Feed:'), False, False, 0)
-        feed_box.pack_start(self.feed_switch, False, False, 0)
+        self.acl_grid = Gtk.Grid()
+        self.acl_grid.set_column_spacing(20)
+        self.acl_grid.set_row_spacing(10)
+        self.acl_grid.set_border_width(10)
         
-        self.feed_count_lbl = Gtk.Label(label='Domains: 0')
-        feed_box.pack_start(self.feed_count_lbl, False, False, 0)
+        # Create the switches
+        self.switch_stevenblack = Gtk.Switch()
+        self.switch_phishing = Gtk.Switch()
+        
+        self.switch_stevenblack.set_valign(Gtk.Align.CENTER)
+        self.switch_phishing.set_valign(Gtk.Align.CENTER)
+        
+        # Connect the toggle signals, passing the feed name as user data
+        self.switch_stevenblack.connect("notify::active", self._on_feed_toggle, "stevenblack")
+        self.switch_phishing.connect("notify::active", self._on_feed_toggle, "phishing_army")
+        
+        # Add them to the layout
+        self.acl_grid.attach(Gtk.Label(label="StevenBlack Ad/Malware Blocklist", xalign=0), 0, 0, 1, 1)
+        self.acl_grid.attach(self.switch_stevenblack, 1, 0, 1, 1)
+        
+        self.acl_grid.attach(Gtk.Label(label="Phishing Army Blocklist", xalign=0), 0, 1, 1, 1)
+        self.acl_grid.attach(self.switch_phishing, 1, 1, 1, 1)
 
-        btn_sync = Gtk.Button(label='Sync Feed Now')
+        btn_sync = Gtk.Button(label='Sync Feeds Now')
         btn_sync.connect('clicked', self._sync_acl_feed)
-        feed_box.pack_start(btn_sync, False, False, 0)
-
-        self.feed_url_entry = Gtk.Entry()
-        self.feed_url_entry.set_placeholder_text('Custom Feed URL')
-        feed_box.pack_start(self.feed_url_entry, True, True, 0)
-
-        btn_set_url = Gtk.Button(label='Set URL')
-        btn_set_url.connect('clicked', self._set_acl_feed_url)
-        feed_box.pack_start(btn_set_url, False, False, 0)
+        self.acl_grid.attach(btn_sync, 0, 2, 2, 1)
         
-        feed_frame.add(feed_box)
+        feed_frame.add(self.acl_grid)
         box.pack_start(feed_frame, False, False, 0)
 
         # Target Inputs
@@ -216,39 +221,47 @@ class ParentControlApp(Gtk.Window):
                 if target:
                     self.acl_store.append([f"{l_type}|{target}", f"[{l_type.upper()}] {target}"])
             
-            self.feed_switch.set_active(payload.get('default_feed_enabled', False))
-            self.feed_count_lbl.set_text(f"Domains: {payload.get('feed_domains_count', 0)}")
+            # Safely extract dynamic feed states
+            feeds = payload.get("feed_sources", {})
+            sb_enabled = feeds.get("stevenblack", {}).get("enabled", False)
+            phish_enabled = feeds.get("phishing_army", {}).get("enabled", False)
+            
+            # Block signals so setting the state programmatically doesn't fire the toggle callback
+            self.switch_stevenblack.handler_block_by_func(self._on_feed_toggle)
+            self.switch_stevenblack.set_active(sb_enabled)
+            self.switch_stevenblack.handler_unblock_by_func(self._on_feed_toggle)
+            
+            self.switch_phishing.handler_block_by_func(self._on_feed_toggle)
+            self.switch_phishing.set_active(phish_enabled)
+            self.switch_phishing.handler_unblock_by_func(self._on_feed_toggle)
+            
         except Exception as exc:
             logging.exception('ACL Load Error: %s', exc)
         finally:
             self._loading = False
 
-    def _on_feed_toggle(self, switch, gparam):
+    def _on_feed_toggle(self, switch, gparam, feed_name):
         if self._loading: return
+        is_enabled = 'true' if switch.get_active() else 'false'
         try:
-            state = 'true' if switch.get_active() else 'false'
-            self._backend_command('acl', '--action', 'toggle-feed', '--enabled', state)
+            self._backend_command('acl', '--action', 'toggle-feed', '--feed', feed_name, '--enabled', is_enabled)
+            logging.info(f"Successfully toggled {feed_name} to {is_enabled}")
             self._load_acl_rules()
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'ACL Feed Error', str(exc))
+            
+            # Revert the UI switch state if the backend command failed
+            switch.handler_block_by_func(self._on_feed_toggle)
+            switch.set_active(not switch.get_active())
+            switch.handler_unblock_by_func(self._on_feed_toggle)
 
     def _sync_acl_feed(self, widget):
         try:
             self._backend_command('acl', '--action', 'sync')
             self._load_acl_rules()
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Feed synced successfully.')
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Feeds synced successfully.')
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'ACL Sync Error', str(exc))
-
-    def _set_acl_feed_url(self, widget):
-        url = self.feed_url_entry.get_text().strip()
-        if not url: return
-        try:
-            self._backend_command('acl', '--action', 'set-feed', '--url', url)
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Feed URL updated.')
-            self._load_acl_rules()
-        except Exception as exc:
-            self._show_msg(Gtk.MessageType.ERROR, 'ACL URL Error', str(exc))
 
     def _add_acl_entry(self, list_type):
         target = self.acl_entry.get_text().strip()
@@ -848,8 +861,9 @@ class ParentControlApp(Gtk.Window):
 
     def _run_maint_now(self):
         try:
+            # Backend handles detachment now; will return near-instantly without freezing GTK
             self._backend_command('maint', '--action', 'run-now')
-            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Maintenance triggered.')
+            self._show_msg(Gtk.MessageType.INFO, 'Success', 'Maintenance task triggered successfully and is running in the background.')
         except Exception as exc:
             self._show_msg(Gtk.MessageType.ERROR, 'Maint Error', str(exc))
 
